@@ -1,0 +1,62 @@
+import {chromium} from 'playwright';
+import express from 'express';
+import assert from 'node:assert/strict';
+import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import os from 'node:os';
+import path from 'node:path';
+import ExcelJS from 'exceljs';
+import {createApp,ROOT} from '../server/index.js';
+import {newProduct,extractFields} from '../server/domain.js';
+import {GenerationService} from '../server/generation.js';
+import {ListingService} from '../server/listing.js';
+import {pythonLaunch,runtimeEnv} from '../server/platform.js';
+const exec=promisify(execFile);const py=await pythonLaunch();const python=args=>exec(py.command,[...py.args,...args],{env:runtimeEnv()});
+const untilUi=async(fn)=>{for(let i=0;i<100;i++){if(fn())return;await new Promise(r=>setTimeout(r,30));}throw new Error('界面状态未更新');};
+const dir=await mkdtemp(path.join(os.tmpdir(),'shiw-ui-'));
+const {app,store,generation,listing}=createApp({dataDir:dir,listingOutputRoot:path.join(dir,'listings'),listingFactory:options=>new ListingService({...options,runnerFactory:()=>({async generate(job){return {title:job.target?'Refined Floral Accessory':'Floral Accessory',description:'A floral accessory for everyday styling.',tags:['floral accessory','everyday accessory','simple accessory'],notesZh:['界面测试替身；包装、物流未确认。'],evidence:[],ruleSuggestion:job.target?'标题简短自然':''};},close(){}})}),outputRoot:path.join(dir,'generated'),collectorFactory:()=>({busy:false,context:null}),generationFactory:options=>new GenerationService({...options,runnerFactory:()=>({
+  async open(){return 'ui-fixture-thread';},
+  async generate(job,c,batchDir){const file=`results/${c.filename}.jpg`;await writeFile(path.join(batchDir,file),await readFile(path.join(dir,'images/999001/a.jpg')));return {status:'completed',file,hash:'ui-fixture',width:1,height:1,reason:'界面测试替身',recommendation:'界面测试用图片，不是真实生成结果'};},close(){}
+})})});
+app.use(express.static(path.join(ROOT,'dist')));
+const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});
+let browser;
+try{
+  const product=newProduct({id:'999001',url:'https://detail.1688.com/offer/999001.html'});product.title='界面验证专用商品';product.status='partial';product.message='采集结束，请检查提示';product.records=[{text:'长度: 25mm',kind:'page'},{text:'材质: 合金',kind:'page'}];product.fields=extractFields(product.records);product.warnings=['一张详情图片下载失败'];product.images=[{id:'img1',relativePath:'999001/a.jpg',url:'https://cbu01.alicdn.com/a.jpg',status:'downloaded',categories:['main','sku'],skuIds:['s1'],order:1},{id:'img2',url:'https://cbu01.alicdn.com/missing.png',status:'failed',error:'HTTP 404',categories:['detail'],skuIds:[],order:2}];product.variants=[{id:'s1',label:'测试金色',fields:product.fields}];store.saveProduct(product);
+  await mkdir(path.join(dir,'images','999001'),{recursive:true});await writeFile(path.join(dir,'images','999001','a.jpg'),await readFile(new URL('../test/fixtures/brooch-parameter-card.jpg',import.meta.url)));
+  product.images[0].qualityStatus='original';store.saveProduct(product);
+  browser=await chromium.launch({...(process.env.WORKBENCH_TEST_BROWSER==='chromium'?{}:{channel:'chrome'}),headless:true});const page=await browser.newPage({viewport:{width:1440,height:1000},acceptDownloads:true});const errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}`,{waitUntil:'networkidle'});
+  await page.getByRole('button',{name:'环境检查',exact:true}).click();const environment=page.getByRole('dialog',{name:'本机环境检查',exact:true});await environment.locator('.environment-check').filter({hasText:'Node.js'}).waitFor();await page.getByRole('button',{name:'关闭环境检查',exact:true}).click();
+  await page.getByRole('button',{name:'填入你的3条示例'}).click();await page.getByText('3 个有效商品',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'展开商品999001'}).click();await page.getByText('测试金色',{exact:true}).waitFor();
+  assert.equal(await page.getByText('包装参数',{exact:true}).count(),0);assert.equal(await page.getByRole('columnheader',{name:/包装/}).count(),0);
+  await page.getByRole('button',{name:'2.5',exact:true}).first().click();await page.getByText('长度: 25mm',{exact:true}).first().waitFor();
+  await page.locator('#field-value').fill('2.8');await page.getByRole('button',{name:'保存参数'}).click();await page.getByRole('button',{name:'2.8',exact:true}).waitFor();assert.equal(store.product('999001').fields.length.value,2.8);
+  await page.getByRole('button',{name:'查看商品999001图片'}).click();await page.getByRole('heading',{name:'商品图片'}).waitFor();await page.locator('.gallery-toolbar').getByRole('button',{name:'下载失败'}).click();await page.getByText('HTTP 404',{exact:true}).waitFor();await page.getByRole('button',{name:'关闭图片库'}).click();
+  await page.getByRole('button',{name:'为测试金色生成 Etsy 图片',exact:true}).click();await page.getByRole('dialog',{name:'Etsy 图片生成'}).waitFor();await page.getByText('已完成 6/12 张，6 张缺少依据',{exact:true}).waitFor();
+  assert.equal(await page.locator('.generation-candidate.completed').count(),6);assert.equal(await page.locator('.generation-candidate.blocked').count(),6);
+  await page.getByRole('button',{name:'放大完整外观 A',exact:true}).click();await page.getByRole('button',{name:'关闭成品大图'}).click();
+  let genDownload=page.waitForEvent('download');await page.getByRole('button',{name:'下载原批次图片包',exact:true}).click();const genZip=await genDownload;const genZipPath=path.join(dir,'etsy.zip');await genZip.saveAs(genZipPath);
+  const genChecked=await python(['-c','import zipfile,json,sys; z=zipfile.ZipFile(sys.argv[1]); print(json.dumps(z.namelist()))',genZipPath]);const genNames=JSON.parse(genChecked.stdout);assert.equal(genNames.filter(n=>n.endsWith('.jpg')).length,6);assert.ok(genNames.includes('成品清单.json'));
+  await page.getByRole('button',{name:'重新生成',exact:true}).click();await page.getByText('已完成 6/12 张，6 张缺少依据',{exact:true}).waitFor();await page.getByRole('combobox',{name:'生图历史批次'}).waitFor();assert.equal(store.imageJobs().length,2);
+  assert.equal(await page.locator('.generation-candidate textarea').count(),0);
+  const card=page.locator('.generation-candidate').filter({has:page.getByRole('button',{name:'修改完整外观 A 图片',exact:true})});
+  await card.getByRole('button',{name:'修改完整外观 A 图片',exact:true}).click();const prompt=page.getByRole('dialog',{name:'修改完整外观 A 图片',exact:true});await prompt.getByRole('textbox',{name:'修改要求',exact:true}).fill('暖色窗光，背景留白多一点');await prompt.getByRole('button',{name:'提交修改',exact:true}).click();
+  const picker=page.getByRole('combobox',{name:'完整外观 A 图片版本',exact:true});await picker.getByRole('option',{name:/调整版本.*全部完成/}).waitFor({state:'attached'});assert.equal(await page.locator('.generation-candidate').count(),12);assert.equal(store.stylePreferences().length,0);assert.equal(store.entries('feedback_events')[0].reviewStatus,'pending');const originalBatch=store.imageJobs().find(j=>j.id===store.imageJobs().find(j=>j.kind==='adjustment').parentJobId);await picker.selectOption(originalBatch.id);assert.equal(await page.locator('.generation-candidate').count(),12);
+  await page.getByText('已完成 6/12 张，6 张缺少依据',{exact:true}).waitFor();assert.equal(await page.locator('.generation-candidate').count(),12);
+  await page.getByRole('button',{name:'关闭 Etsy 图片生成'}).click();await page.getByRole('button',{name:'查看成品',exact:true}).click();await page.getByRole('dialog',{name:'Etsy 图片生成'}).waitFor();await page.keyboard.press('Escape');
+  await page.getByRole('button',{name:/修改审阅中心/}).click();await page.getByText('修改要求：暖色窗光，背景留白多一点',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'编辑并审阅规则',exact:true}).click();const approval=page.getByRole('dialog',{name:'确认长期规则',exact:true});await approval.getByRole('button',{name:'确认并更新长期规则'}).click();await page.getByText('长期规则 v1',{exact:true}).waitFor();assert.equal(store.activeRules('other','image','overview').length,1);
+  await page.getByRole('button',{name:'商品采集',exact:false}).click();await page.getByRole('button',{name:'查看商品999001上架文案'}).click();const copyDialog=page.getByRole('dialog',{name:'Etsy 上架文案'});await copyDialog.getByRole('button',{name:'生成上架文案',exact:true}).click();await copyDialog.getByText('Floral Accessory',{exact:true}).waitFor();assert.equal(await copyDialog.locator('textarea').count(),0);
+  await copyDialog.getByRole('button',{name:'修改标题',exact:true}).click();const editCopy=page.getByRole('dialog',{name:'修改标题',exact:true});await editCopy.getByRole('textbox',{name:'修改要求',exact:true}).fill('标题简短自然');await editCopy.getByRole('button',{name:'提交修改',exact:true}).click();await copyDialog.locator('.listing-text').filter({hasText:'Refined Floral Accessory'}).waitFor();assert.equal(listing.current('999001').content.title,'Floral Accessory');await copyDialog.getByRole('button',{name:'采用此标题版本'}).click();await untilUi(()=>listing.current('999001').content.title==='Refined Floral Accessory');
+  await copyDialog.getByRole('button',{name:'直接编辑描述'}).click();const direct=page.getByRole('dialog',{name:'直接编辑描述',exact:true});await direct.getByRole('textbox',{name:'编辑内容',exact:true}).fill('A personally edited floral accessory description.');await direct.getByRole('button',{name:'保存并采用',exact:true}).click();await copyDialog.getByText('A personally edited floral accessory description.',{exact:true}).waitFor();await page.getByRole('button',{name:'关闭上架文案'}).click();
+  await page.getByRole('checkbox',{name:'选择商品999001',exact:true}).check();
+  let downloadPromise=page.waitForEvent('download');await page.getByRole('button',{name:'导出表格',exact:true}).click();const excel=await downloadPromise;const excelPath=path.join(dir,'export.xlsx');await excel.saveAs(excelPath);const workbook=new ExcelJS.Workbook();await workbook.xlsx.load(await readFile(excelPath));assert.equal(workbook.worksheets[0].getCell('E2').value,2.8);assert.equal(workbook.worksheets[1].getCell('G2').value,2.5);assert.ok(workbook.worksheets.every(sheet=>sheet.getRow(1).values.every(value=>!String(value).includes('包装'))));assert.equal(workbook.getWorksheet('Etsy 上架文案').getCell('B2').value,'Refined Floral Accessory');assert.equal(workbook.getWorksheet('Etsy 上架文案').getCell('C2').value,'A personally edited floral accessory description.');
+  downloadPromise=page.waitForEvent('download');await page.getByRole('button',{name:'下载图片',exact:true}).click();const zip=await downloadPromise;const zipPath=path.join(dir,'images.zip');await zip.saveAs(zipPath);
+  const checked=await python(['-c','import zipfile,json,sys; z=zipfile.ZipFile(sys.argv[1]); names=z.namelist(); print(json.dumps({"names":names,"manifest":json.loads(z.read(next(n for n in names if n.endswith("图片清单.json"))))},ensure_ascii=False))',zipPath]);
+  const {names,manifest}=JSON.parse(checked.stdout);assert.ok(names.some(n=>n.endsWith('01-主图/001-a.jpg')),JSON.stringify(names));assert.equal(manifest.images.length,2);assert.equal(manifest.images[1].status,'failed');assert.deepEqual(manifest.images[0].categories,['main','sku']);
+  await page.getByRole('button',{name:'采集记录',exact:false}).click();await page.getByText('还没有采集记录').waitFor();assert.deepEqual(errors,[]);
+  console.log('界面验证通过：示例链接、规格参数保存、失败图库、Excel/原图ZIP、生图按钮与进度、缺失参数提示、成品放大与ZIP、重新生成与历史批次、采集记录、收起修改弹窗、长期规则批准、文案修改与采用、人工编辑及导出一致。生图及文案使用隔离测试替身，实际生成另行联调。');
+}finally{await browser?.close();await generation.close();await listing.close();await new Promise(resolve=>server.close(resolve));store.close();await rm(dir,{recursive:true,force:true});}

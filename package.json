@@ -1,0 +1,41 @@
+{
+  "name": "1688-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.js --dev",
+    "build": "vite build",
+    "start": "node server/index.js",
+    "test": "node --test test/*.test.js",
+    "test:ui": "node scripts/verify-ui.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "launch": "node scripts/launch.mjs start",
+    "login:gpt": "node scripts/launch.mjs login",
+    "check:share": "node scripts/check-share.mjs",
+    "package:project": "node scripts/package-project.mjs"
+  },
+  "dependencies": {
+    "@tesseract.js-data/chi_sim": "1.0.0",
+    "@tesseract.js-data/eng": "1.0.0",
+    "archiver": "^7.0.1",
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "playwright": "^1.56.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sharp": "0.34.5",
+    "tesseract.js": "6.0.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "vite": "^6.4.1"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "optionalDependencies": {
+    "exiftool-vendored.exe": "13.60.0"
+  }
+}

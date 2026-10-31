@@ -1,0 +1,50 @@
+name: Mac and Windows compatibility
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      WORKBENCH_TEST_BROWSER: chromium
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: npm ci --include=optional --no-audit --no-fund
+      - if: runner.os == 'macOS'
+        run: brew install exiftool
+      - run: npx playwright install chromium
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:ui
+      - run: npm run check:share
+  package:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --include=optional --no-audit --no-fund
+      - run: npm run package:project
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 1688-workbench-mac-windows
+          path: output/exports/1688-workbench-mac-windows.zip
+          if-no-files-found: error

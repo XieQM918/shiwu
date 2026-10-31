@@ -1,0 +1,24 @@
+# Per-computer accounts, collected products, preferences, images and generated files
+/data/
+/output/
+/node_modules/
+/dist/
+/.codex/
+/.env
+/.env.*
+!/.env.example
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+*.traineddata
+*.traineddata.gz
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.zip
+# Do not commit browser profiles or credentials even if copied outside data/
+**/browser-profile/
+**/auth.json
+**/cookies.json
+**/storage-state.json

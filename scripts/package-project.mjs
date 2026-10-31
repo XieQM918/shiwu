@@ -1,0 +1,11 @@
+import path from 'node:path';
+import {createWriteStream} from 'node:fs';
+import {mkdir,readFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import archiver from 'archiver';
+import {distributionEntries,ROOT} from './distribution.mjs';
+const entries=await distributionEntries();const option=process.argv.indexOf('--output');const output=path.resolve(option>=0?process.argv[option+1]:path.join(ROOT,'output/exports/1688-workbench-mac-windows.zip'));await mkdir(path.dirname(output),{recursive:true});
+const hashes=[];for(const entry of entries)hashes.push({path:entry.relative,sha256:createHash('sha256').update(await readFile(entry.file)).digest('hex')});
+const stream=createWriteStream(output),archive=archiver('zip',{zlib:{level:6}});const done=new Promise((resolve,reject)=>{stream.on('close',resolve);stream.on('error',reject);archive.on('error',reject);});archive.pipe(stream);
+for(const entry of entries)archive.file(entry.file,{name:'1688-workbench/'+entry.relative,mode:entry.mode});archive.append(JSON.stringify({createdAt:new Date().toISOString(),files:hashes,excluded:['data/','output/','node_modules/','dist/','本机GPT和1688登录、个人偏好、成品']},null,2),{name:'1688-workbench/工程文件清单.json'});
+await archive.finalize();await done;console.log(`已创建工程包：${output}\n${entries.length}个源文件，不包含任何本机账号或采集结果。`);

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Etsy 饰品场景出图"
+  short_description: "根据商品素材与真实参数，按饰品品类生成多场景真实摄影候选图"
+  default_prompt: "使用 $etsy-accessory-images，根据我提供的商品素材和参数，按品类生成每场景2–3张真实自然的候选图片。"
+policy:
+  allow_implicit_invocation: true

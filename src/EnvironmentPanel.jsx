@@ -1,0 +1,8 @@
+import React,{useState,useEffect} from 'react';
+import {X,RefreshCw,LoaderCircle,CheckCircle2,TriangleAlert} from 'lucide-react';
+export function EnvironmentPanel({onClose}){
+  const [report,setReport]=useState(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  async function load(){setBusy(true);setError('');try{const r=await fetch('/api/environment');const j=await r.json();if(!r.ok)throw new Error(j.error);setReport(j);}catch(e){setError(e.message);}finally{setBusy(false);}}
+  useEffect(()=>{load();},[]);
+  return <div className="overlay listing-overlay" onClick={onClose}><section className="prompt-dialog environment-dialog" role="dialog" aria-modal="true" aria-label="本机环境检查" onClick={e=>e.stopPropagation()}><div className="gallery-heading"><div><div className="eyebrow">LOCAL SETUP</div><h2>本机环境检查</h2></div><button className="icon-button" aria-label="关闭环境检查" onClick={onClose}><X size={20}/></button></div><div className="prompt-body">{error&&<p role="alert" className="text-red">{error}</p>}{busy&&<p><LoaderCircle size={16} className="spin"/>正在检查本机组件，不调用生图…</p>}{report?.checks.map(c=><article className="environment-check" key={c.id}>{c.status==='ok'?<CheckCircle2 size={18}/>:<TriangleAlert size={18}/>}<div><strong>{c.label}<small>{({ok:'已就绪',warning:'待设置',error:'需安装或修复'})[c.status]}</small></strong><p>{c.message}</p></div></article>)}{report&&<><p>{report.accountIsolation}</p><small>{report.generationNote}</small></>}</div><div className="prompt-actions"><button className="button secondary" disabled={busy} onClick={load}><RefreshCw size={14}/>重新检查</button><button className="button primary" onClick={onClose}>完成</button></div></section></div>;
+}
