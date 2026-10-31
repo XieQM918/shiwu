@@ -9,6 +9,12 @@ import {CodexClient,finalJson} from './codex-client.js';
 import {freezeInput,planCandidates,confirmedField,candidateInput,RESULT_SCHEMA,containedFile,hashBuffer,profileKey} from './generation-input.js';
 
 const ACTIVE=['queued','running'];
+export function usageSummary(job){
+  const records=job.candidates.flatMap(c=>c.usageHistory||[]);
+  if(!records.length)return null;
+  const known=records.filter(r=>r.tokensKnown);
+  return {recordedTurns:records.length,tokenRecordedTurns:known.length,...Object.fromEntries(['inputTokens','cachedInputTokens','outputTokens','reasoningOutputTokens','totalTokens','imageCalls','imageViews','commands','durationMs'].map(k=>[k,records.reduce((n,r)=>n+(Number(r[k])||0),0)])),quotaBefore:records[0].quotaBefore||null,quotaAfter:records.at(-1).quotaAfter||null};
+}
 export function imageJobSummary(job){
   const completed=job.candidates.filter(c=>c.status==='completed').length;
   return {id:job.id,productId:job.productId,skuId:job.skuId,skuLabel:job.snapshot.skuLabel,status:job.status,message:job.message,
@@ -16,6 +22,7 @@ export function imageJobSummary(job){
     blocked:job.candidates.filter(c=>c.status==='blocked').length,failed:job.candidates.filter(c=>c.status==='failed').length,
     previews:job.candidates.filter(c=>c.preview&&c.status!=='completed').length,
     kind:job.kind||'batch',parentJobId:job.parentJobId,parentCandidateId:job.parentCandidateId,
+    usage:job.usage||null,planVersion:job.planVersion||1,
     current:job.candidates.find(c=>c.status==='running')?.id||null};
 }
 export function imageType(buffer){
@@ -28,7 +35,7 @@ export function imageType(buffer){
 export class CodexImageRunner {
   constructor({ocr,clientFactory=options=>new CodexClient(options)}={}){this.ocr=ocr;this.clientFactory=clientFactory;}
   async open(job,batchDir,onEvent){
-    this.prepared=false;
+    this.usedThread=false;
     if(process.platform==='darwin'){
       // Let the display sleep while keeping an explicitly started batch running.
       this.keepAwake=spawn('/usr/bin/caffeinate',['-i','-w',String(process.pid)],{stdio:'ignore'});this.keepAwake.on('error',()=>{});
@@ -38,7 +45,8 @@ export class CodexImageRunner {
     const selected=models.data?.find(m=>m.isDefault)||models.data?.[0];
     if(!selected)throw new Error('当前 Codex 账号没有可用模型，请检查本机登录状态。');
     this.model=selected.model||selected.id;
-    const instructions='你只负责当前规格的商品摄影。首次读取Skill和指南后持续复用；每张图显式传入原始商品参考。用户要求快速返回：只做一次简短关键核对，默认不自动重画，不反复读取文档/查看相同图片，不输出长篇过程分析。风格反馈只影响摄影，不改变真实商品。仅用内置生图，只在当前任务目录保存，不改代码、设置、不读凭据、不发消息、不创建子代理；缺失事实返回blocked。';
+    const instructions='你只负责当前一张商品摄影，使用独立短会话，不需要前面成品的历史。原图已在输入展示，不重复打开；Skill/指南至多各读取一次，风格参考最多一张。快速出图并做一次简短核对，默认不自动重画，不写长篇分析。内置生图返回图片已在视觉上下文中时不再重复view_image。只在当前任务目录保存，不改代码、设置、不读凭据、不发消息、不创建子代理；缺少指定视角依据时直接返回blocked，不耗费生图。';
+    this.instructions=instructions;
     // A fresh runtime thread on recovery avoids accidentally continuing an interrupted tool call.
     this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:instructions,model:this.model});
     onEvent({threadId:this.threadId,model:this.model});return this.threadId;
@@ -48,8 +56,11 @@ export class CodexImageRunner {
       if(ref.hash&&hashBuffer(await readFile(await containedFile(batchDir,ref.path)))!==ref.hash)throw new Error('冻结的参考图片发生变化，请重新建立批次。');
     }
     if(hashBuffer(await readFile(path.join(batchDir,job.snapshot.skill.path)))!==job.snapshot.skill.sha256)throw new Error('冻结的 Skill 版本发生变化，请重新建立批次。');
+    // Never replay the previous generated images into the next photograph.
+    if(this.usedThread){this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:this.instructions,model:this.model});onEvent({threadId:this.threadId});}
+    this.usedThread=true;
     const attempts=new Set(),previewTasks=[];const maxAttempts=job.options?.autoRepair?3:1;
-    const result=await this.client.runTurn({threadId:this.threadId,input:candidateInput(job,candidate,batchDir,{includeSkill:!this.prepared}),outputSchema:RESULT_SCHEMA,signal,onEvent:event=>{
+    const result=await this.client.runTurn({threadId:this.threadId,input:candidateInput(job,candidate,batchDir),outputSchema:RESULT_SCHEMA,signal,collectUsage:true,onEvent:event=>{
       const item=event.params?.item;
       if(item?.type==='imageGeneration'){
         attempts.add(item.id);
@@ -61,9 +72,10 @@ export class CodexImageRunner {
       }
       else if(item?.type==='imageView')onEvent({message:'正在对照原图检查'});
     }});
-    await Promise.all(previewTasks);this.prepared=true;
+    await Promise.all(previewTasks);
+    if(result.usage)onEvent({usage:result.usage});
     const answer=finalJson(result);
-    const productBrief=typeof answer.productBrief==='string'?answer.productBrief.slice(0,1600):'';
+    const productBrief=typeof answer.productBrief==='string'?answer.productBrief.slice(0,600):'';
     if(!['completed','blocked','failed'].includes(answer.status))throw new Error('Codex 返回的任务状态无效');
     if(answer.status!=='completed')return {status:answer.status,reason:answer.reason||'缺少生成依据',attempts:answer.attempts||0,productBrief};
     if(answer.reviewed!==true)throw new Error('输出尚未经过逐张检查，未列为合格成品');
@@ -139,7 +151,7 @@ export class GenerationService {
     const batchDir=path.join(this.outputRoot,directory);
     const snapshot=await freezeInput({product,variant,dataDir:this.dataDir,batchDir,skillPath:this.skillPath});
     await mkdir(path.join(batchDir,'results'),{recursive:true});
-    const job={id,productId,skuId,createdAt,directory,snapshot,candidates:planCandidates(snapshot),status:'queued',message:'已加入生图队列',threadIds:[],kind:'batch',options:{autoRepair:options?.autoRepair===true}};
+    const job={id,productId,skuId,createdAt,directory,snapshot,candidates:planCandidates(snapshot),planVersion:2,status:'queued',message:'已加入精简生图队列：最多6张，角度为正面/侧面/背面',threadIds:[],kind:'batch',options:{autoRepair:options?.autoRepair===true}};
     this.freezeRules(job);
     this.store.saveImageJob(job);this.kick();return job;
   }
@@ -176,8 +188,8 @@ export class GenerationService {
     const snapshot=structuredClone(parent.snapshot);snapshot.fields={...snapshot.fields,...parent.confirmedUpdates};snapshot.frozenAt=createdAt;
     const job={id:idNew,productId:parent.productId,skuId:parent.skuId,createdAt,directory,snapshot,kind:'adjustment',parentJobId:id,parentCandidateId:candidateId,
       adjustment:{instruction,sourceFile,sourceHash:hashBuffer(buffer),sourceImageHash:usePreview?original.preview.hash:original.hash},
-      options:{autoRepair:false},status:'queued',message:'风格要求已记录，当前图片结束后优先调整',threadIds:[],
-      candidates:[{id:original.id,scene:original.scene,label:original.label,letter:original.letter,filename:original.filename,status:'pending',reason:'',attempts:0}]};
+      planVersion:parent.planVersion||1,options:{autoRepair:false},status:'queued',message:'风格要求已记录，当前图片结束后优先调整',threadIds:[],
+      candidates:[{id:original.id,scene:original.scene,label:original.label,letter:original.letter,view:original.view,viewLabel:original.viewLabel,viewBrief:original.viewBrief,filename:original.filename,status:'pending',reason:'',attempts:0}]};
     this.freezeRules(job);
     if(this.review)job.feedbackId=this.review.imageCreated(job,parent,original).id;
     let root=parent;while(root.parentJobId)root=this.get(root.parentJobId);
@@ -217,11 +229,11 @@ export class GenerationService {
       job.confirmedUpdates={...job.confirmedUpdates,...updates};
       await writeFile(path.join(await this.directory(job),'input-updates.json'),JSON.stringify(job.confirmationHistory,null,2));
     }
-    const replanned=planCandidates({...job.snapshot,fields:{...job.snapshot.fields,...job.confirmedUpdates}});
+    const replanned=planCandidates({...job.snapshot,fields:{...job.snapshot.fields,...job.confirmedUpdates}},{legacy:!job.planVersion||job.planVersion<2});
     for(const c of job.candidates){
       if(c.status==='completed')continue;
       const fresh=replanned.find(p=>p.id===c.id);
-      if(c.status==='blocked'&&fresh.status!=='blocked'&&(retry||c.scene==='use'||c.scene==='scale')){c.status='pending';c.reason='';}
+      if(c.status==='blocked'&&fresh?.status!=='blocked'&&(retry||c.scene==='use'||c.scene==='scale')){c.status='pending';c.reason='';}
       if(retry&&c.status==='failed'){c.status='pending';c.reason='';}
     }
     if(!job.candidates.some(c=>c.status==='pending')){
@@ -255,13 +267,16 @@ export class GenerationService {
         c.status='running';job.message=`${c.label} ${c.letter} · 正在生成`;await this.persist(job);
         const effective={...job,snapshot:{...job.snapshot,fields:{...job.snapshot.fields,...job.confirmedUpdates}}};
         try{
-          const result=await runner.generate(effective,c,dir,{signal:active.controller.signal,onEvent:({message,attempts,preview})=>{
+          const result=await runner.generate(effective,c,dir,{signal:active.controller.signal,onEvent:({message,attempts,preview,threadId,usage})=>{
+            if(threadId){job.threadIds.push(threadId);job.threadId=threadId;}
+            if(usage){c.usageHistory||=[];c.usageHistory.push(usage);job.usage=usageSummary(job);this.store.saveImageJob(job);}
             if(!active.stop&&!this.closing&&message){if(attempts)c.attempts=attempts;if(preview)c.preview=preview;job.message=`${c.label} ${c.letter} · ${message}`;this.store.saveImageJob(job);}
           }});
           if(active.stop||this.closing){c.status='pending';break;}
           Object.assign(c,result);
           if(result.productBrief){job.profile={brief:result.productBrief,productId:job.productId,skuId:job.skuId,createdAt:new Date().toISOString()};this.store.saveImageProfile(factsKey,job.profile);}
         }catch(e){
+          if(e.usage){c.usageHistory||=[];c.usageHistory.push(e.usage);job.usage=usageSummary(job);}
           if(active.stop||this.closing){c.status='pending';break;}
           c.status='failed';c.reason=e.message;
           // A broken transport/auth connection cannot be repaired by generating the next eleven images.

@@ -27,7 +27,10 @@ test('冻结素材只取当前规格原图，保留来源与技能版本，不�
     f.p.fields=extractFields([{text:'长度: 4cm'},{text:'宽度: 3cm'}]);
     const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:path.join(f.outputRoot,'batch')});
     assert.deepEqual(snapshot.refs.map(r=>r.imageId),['i-purple']);assert.equal(snapshot.skill.sha256.length,64);
-    const candidates=planCandidates(snapshot);assert.equal(candidates.length,12);assert.equal(candidates.filter(c=>c.status==='blocked').length,6);
+    const candidates=planCandidates(snapshot);assert.equal(candidates.length,6);assert.equal(candidates.filter(c=>c.status==='blocked').length,2);
+    assert.deepEqual(candidates.filter(c=>c.scene==='angle').map(c=>c.view),['front','side','back']);
+    assert.deepEqual(candidates.filter(c=>c.scene!=='angle').map(c=>c.id),['use-A','overview-A','scale-A']);
+    const back=candidateInput({snapshot},candidates.find(c=>c.view==='back'),path.join(f.outputRoot,'batch'))[0].text;assert.match(back,/没有证据则返回blocked，不调用生图/);
     await writeFile(path.join(f.dataDir,'images/123/purple.png'),'changed');assert.deepEqual(await readFile(path.join(f.outputRoot,'batch/input/01.png')),PNG);
     const input=candidateInput({snapshot},candidates[3],path.join(f.outputRoot,'batch'));
     assert.ok(input.some(i=>i.type==='skill'));assert.equal(input.filter(i=>i.type==='localImage').length,1);
@@ -47,10 +50,10 @@ test('重复点击合并任务，两个规格串行执行；部分失败保留�
   try{
     const [a,b]=await Promise.all([service.create('123','purple'),service.create('123','purple')]);assert.equal(a.id,b.id);
     const blue=await service.create('123','blue');await waitFor(()=>!['queued','running'].includes(service.get(blue.id).status));
-    const j=service.get(a.id);assert.equal(j.status,'partial');assert.equal(imageJobSummary(j).completed,5);assert.equal(maxActive,1);
-    const before=calls.length;await service.resume(j.id,{retry:true});await waitFor(()=>!['queued','running'].includes(service.get(j.id).status));assert.equal(calls.length,before+1);assert.equal(imageJobSummary(service.get(j.id)).completed,6);
+    const j=service.get(a.id);assert.equal(j.status,'partial');assert.equal(imageJobSummary(j).completed,3);assert.equal(maxActive,1);
+    const before=calls.length;await service.resume(j.id,{retry:true});await waitFor(()=>!['queued','running'].includes(service.get(j.id).status));assert.equal(calls.length,before+1);assert.equal(imageJobSummary(service.get(j.id)).completed,4);
     const p=f.store.product('123');for(const key of ['length','width'])p.variants[0].fields[key]={value:3,status:'manual',sources:[]};f.store.saveProduct(p);
-    await service.resume(j.id);await waitFor(()=>service.get(j.id).status==='done');assert.equal(imageJobSummary(service.get(j.id)).completed,12);assert.equal(service.get(j.id).snapshot.fields.length.status,'missing');assert.equal(service.get(j.id).confirmedUpdates.length.status,'manual');
+    await service.resume(j.id);await waitFor(()=>service.get(j.id).status==='done');assert.equal(imageJobSummary(service.get(j.id)).completed,6);assert.equal(service.get(j.id).snapshot.fields.length.status,'missing');assert.equal(service.get(j.id).confirmedUpdates.length.status,'manual');
     const next=await service.create('123','purple');assert.notEqual(next.id,j.id);await service.stop(next.id);
   }finally{await service.close();await f.clean();}
 });
@@ -66,7 +69,7 @@ test('停止和服务重启保留结果，未完成候选可继续，采集任�
 
 test('未实际生成、未查看的结果不能成为成品；路径穿越和符号链接不能下载',async()=>{
   const f=await setup();try{
-    const runner=new CodexImageRunner({ocr:{}});runner.threadId='test';const base={messages:[JSON.stringify({status:'completed',path:'/tmp/fake.png',reviewed:false,reason:'fake'})],items:[]};runner.client={runTurn:async()=>base};
+    const runner=new CodexImageRunner({ocr:{}});runner.threadId='test';const base={messages:[JSON.stringify({status:'completed',path:'/tmp/fake.png',reviewed:false,reason:'fake'})],items:[]};runner.client={runTurn:async()=>base,startThread:async()=> 'fresh-test'};
     const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:path.join(f.outputRoot,'batch')});const j={snapshot};const c=planCandidates(snapshot)[3];
     await assert.rejects(()=>runner.generate(j,c,path.join(f.outputRoot,'batch'),{onEvent:()=>{}}),/尚未经过逐张检查/);
     base.messages=[JSON.stringify({status:'completed',path:'/tmp/fake.png',reviewed:true,reason:'fake'})];await assert.rejects(()=>runner.generate(j,c,path.join(f.outputRoot,'batch'),{onEvent:()=>{}}),/未收到内置生图/);
@@ -98,7 +101,7 @@ test('逐图调整保留旧版本，新偏好待审阅，批准后按品类场�
   }finally{await service.close();await f.clean();}
 });
 
-test('后续出图不重复注入Skill，风格与原始商品约束均进入指令，默认禁止自动重画',async()=>{
+test('单张指令包含摄影偏好与原始商品约束，默认禁止自动重画',async()=>{
   const f=await setup();try{
     const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:path.join(f.outputRoot,'batch')});const c=planCandidates(snapshot)[3];c.preferences=[{id:'p',instruction:'自然窗光'}];
     const input=candidateInput({snapshot,profile:{brief:'紫色商品'},adjustment:{instruction:'增加留白',sourceFile:'input/edit.png'}},c,path.join(f.outputRoot,'batch'),{includeSkill:false});
@@ -115,4 +118,32 @@ test('生图返回后先发布可读取预览，核对未结束时也不把草�
     const promise=runner.generate({snapshot},planCandidates(snapshot)[3],dir,{onEvent:({preview})=>{if(preview){assert.equal(preview.review,'pending');assert.ok(preview.file.startsWith('drafts/'));seen=true;}}});
     await waitFor(()=>seen);release();const result=await promise;assert.equal(result.status,'failed');assert.equal(result.reason,'测试：待调整');
   }finally{await f.clean();}
+});
+
+test('每张使用独立会话，记录跳过与失败用量，三视角及单张修改不会串位置',async()=>{
+  const f=await setup();let threads=0;const sent=[];const events=[];
+  const client={async connect(){},async request(){return {data:[{isDefault:true,model:'account-default'}]};},async startThread(){return 'isolated-'+(++threads);},async runTurn(options){sent.push(options);return {usage:{tokensKnown:true,inputTokens:100,cachedInputTokens:60,outputTokens:5,totalTokens:105,imageCalls:0},messages:[JSON.stringify({status:'blocked',path:null,reviewed:false,reason:'没有当前规格背面证据',recommendation:'',attempts:0,productBrief:'商品正面已确认'})],items:[]};},close(){}};
+  const runner=new CodexImageRunner({clientFactory:()=>client});
+  try{
+    const dir=path.join(f.outputRoot,'independent');const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:dir});const candidates=planCandidates(snapshot);
+    await runner.open({snapshot},dir,()=>{});
+    for(const c of candidates.filter(c=>c.scene==='angle'))await runner.generate({snapshot},c,dir,{onEvent:e=>events.push(e)});
+    assert.equal(threads,3);assert.equal(new Set(sent.map(x=>x.threadId)).size,3);assert.ok(sent.every(x=>x.collectUsage));assert.equal(events.filter(x=>x.usage).length,3);assert.equal(events.filter(x=>x.threadId).length,2);
+    assert.match(sent[2].input[0].text,/指定独立视角：背面/);assert.ok(sent.every(x=>!x.input[0].text.includes('后续候选沿用此上下文')));
+  }finally{runner.close();await f.clean();}
+});
+
+test('旧十二张批次重试保持十二个位置，新批次仍为六张，用量在失败和重试后累计',async()=>{
+  const f=await setup();let fail=true;
+  const service=new GenerationService({...f,runnerFactory:()=>({async open(){return 'fixture';},async generate(job,c,dir,{onEvent}){
+    const usage={tokensKnown:true,inputTokens:100,cachedInputTokens:80,outputTokens:5,totalTokens:105,imageCalls:1};
+    if(c.id==='overview-A'&&fail){fail=false;const e=new Error('本张核对失败');e.usage=usage;throw e;}
+    onEvent({usage});const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file,hash:'fixture'};
+  },close(){}})});
+  try{
+    const a=await service.create('123','purple');await waitFor(()=>!['queued','running'].includes(service.get(a.id).status));const old=service.get(a.id);assert.equal(old.usage.imageCalls,4);assert.equal(old.usage.totalTokens,420);
+    old.candidates=planCandidates(old.snapshot,{legacy:true}).map(c=>old.candidates.find(x=>x.id===c.id)||c);delete old.planVersion;f.store.saveImageJob(old);
+    await service.resume(a.id,{retry:true});await waitFor(()=>!['queued','running'].includes(service.get(a.id).status));const done=service.get(a.id);assert.equal(done.candidates.length,12);assert.equal(done.candidates.filter(c=>c.status==='completed').length,6);assert.equal(done.usage.imageCalls,7);assert.equal(done.candidates.find(c=>c.id==='overview-A').usageHistory.length,2);
+    const b=await service.create('123','blue');assert.equal(b.candidates.length,6);await service.stop(b.id);
+  }finally{await service.close();await f.clean();}
 });

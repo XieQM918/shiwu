@@ -4,6 +4,13 @@ import {EventEmitter} from 'node:events';
 import {codexLaunch,runtimeEnv} from './platform.js';
 export {codexExecutable} from './platform.js';
 
+// Store counters and quota windows only, never account identity, tokens or tool arguments.
+export function quotaWindows(value){
+  if(!value)return null;
+  const buckets=value.rateLimitsByLimitId?Object.values(value.rateLimitsByLimitId):[value.rateLimits||value];
+  return buckets.filter(Boolean).map(b=>({limitId:b.limitId||null,...Object.fromEntries(['primary','secondary'].map(k=>[k,b[k]?{usedPercent:b[k].usedPercent,windowDurationMins:b[k].windowDurationMins,resetsAt:b[k].resetsAt}:null]))}));
+}
+
 // A private stdio connection: no shell interpolation, public socket or API key.
 export class CodexClient extends EventEmitter {
   constructor({cwd,executable,spawnProcess=spawn}={}){
@@ -48,13 +55,25 @@ export class CodexClient extends EventEmitter {
       config:{'features.apps':false,'features.plugins':false,'features.multi_agent':false,'features.browser_use':false,'features.computer_use':false}});
     return result.thread.id;
   }
-  async runTurn({threadId,input,outputSchema,onEvent=()=>{},signal,effort='low',timeoutMs=25*60*1000,timeoutMessage='本张图片生成超时；可重试未完成项。'}){
+  async runTurn({threadId,input,outputSchema,onEvent=()=>{},signal,effort='low',collectUsage=false,timeoutMs=25*60*1000,timeoutMessage='本张图片生成超时；可重试未完成项。'}){
     let turnId;let timer;const items=[];const messages=[];
+    const started=Date.now(),calls=new Map();this.tokenTotals||=new Map();const baseline=this.tokenTotals.get(threadId)||{};
+    const usage={threadId,startedAt:new Date(started).toISOString(),tokensKnown:false};let latest;
+    const snapshotUsage=()=>{const types=[...calls.values()];return {...usage,turnId,durationMs:Date.now()-started,
+      imageCalls:types.filter(t=>t==='imageGeneration').length||types.filter(t=>t==='mcpImage').length,
+      imageViews:types.filter(t=>t==='imageView').length,commands:types.filter(t=>t==='commandExecution').length};};
     let completed=false;
     const done=new Promise((resolve,reject)=>{
       this.turnReject=reject;
       this.turnListener=event=>{
-        const p=event.params||{};if(p.threadId!==threadId)return;
+        const p=event.params||{};
+        if(collectUsage&&event.method==='account/rateLimits/updated'){usage.quotaAfter=quotaWindows(p);return;}
+        if(p.threadId!==threadId)return;
+        if(collectUsage&&event.method==='thread/tokenUsage/updated'&&p.tokenUsage?.total){
+          latest=p.tokenUsage.total;usage.tokensKnown=true;
+          for(const k of ['inputTokens','cachedInputTokens','outputTokens','reasoningOutputTokens','totalTokens'])usage[k]=Math.max(0,(latest[k]||0)-(baseline[k]||0));
+        }
+        if(collectUsage&&event.method.startsWith('item/')&&p.item?.id){const i=p.item;calls.set(i.id,i.type==='mcpToolCall'&&/imagegen|image_gen/.test(`${i.server} ${i.tool}`)?'mcpImage':i.type);}
         onEvent(event);
         if(event.method==='item/completed'){
           items.push(p.item);
@@ -76,10 +95,15 @@ export class CodexClient extends EventEmitter {
     signal?.addEventListener('abort',abort,{once:true});
     try{
       if(signal?.aborted)throw new Error('任务已停止');
+      if(collectUsage)usage.quotaBefore=quotaWindows(await this.request('account/rateLimits/read',{},4000).catch(()=>null));
       const r=await this.request('turn/start',{threadId,input,outputSchema,effort});turnId=r.turn.id;
       if(signal?.aborted)abort();
-      return await done;
+      const result=await done;
+      if(collectUsage){usage.quotaAfter=quotaWindows(await this.request('account/rateLimits/read',{},4000).catch(()=>null))||usage.quotaAfter;result.usage=snapshotUsage();}
+      return result;
+    }catch(e){if(collectUsage)e.usage=snapshotUsage();throw e;
     }finally{
+      if(latest)this.tokenTotals.set(threadId,latest);
       clearTimeout(timer);signal?.removeEventListener('abort',abort);
       this.off('notification',this.turnListener);this.off('disconnect',this.disconnectListener);
       if(!completed&&turnId)this.request('turn/interrupt',{threadId,turnId},5000).catch(()=>{});
