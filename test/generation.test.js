@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import {Store} from '../server/db.js';
 import {ReviewService} from '../server/review.js';
+import {WebWait} from '../server/chatgpt-web.js';
 import {newProduct,extractFields} from '../server/domain.js';
 import {GenerationService,CodexImageRunner,imageJobSummary,imageType} from '../server/generation.js';
 import {freezeInput,planCandidates,containedFile,candidateInput} from '../server/generation-input.js';
@@ -21,6 +22,18 @@ async function setup(){
   return {dir,dataDir,outputRoot,store,skillPath,p,clean:async()=>{store.close();await rm(dir,{recursive:true,force:true});}};
 }
 const waitFor=async(predicate)=>{for(let i=0;i<250;i++){if(predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('等待状态超时');};
+
+test('会员网页登录等待暂停队列、重复提交合并、停止解除等待，旧Codex任务不能自动续跑',async()=>{
+ const f=await setup();let opens=0;const service=new GenerationService({...f,runnerFactory:()=>({async open(){if(++opens===1)throw new WebWait('login','请登录会员网页');return null;},async generate(job,c,dir){const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file};},close(){}})});
+ try{
+  const a=await service.create('123','purple');const b=await service.create('123','blue');await waitFor(()=>!service.active&&service.get(a.id).waitReason==='login');
+  assert.equal(service.get(a.id).status,'paused');assert.equal(service.get(b.id).status,'queued');assert.equal(opens,1);assert.equal((await service.create('123','purple')).id,a.id);
+  f.store.recover();assert.equal(service.get(a.id).waitReason,'login'); // queued tasks become paused on restart
+  await service.stop(a.id);await service.resume(b.id);await waitFor(()=>!service.active&&service.get(b.id).status==='partial');assert.equal(opens,2);
+  const legacy=service.get(a.id);delete legacy.provider;legacy.status='paused';f.store.saveImageJob(legacy);
+  const strict=new GenerationService({...f});try{await assert.rejects(()=>strict.resume(a.id),/历史Codex批次/);}finally{await strict.close();}
+ }finally{await service.close();await f.clean();}
+});
 
 test('冻结素材只取当前规格原图，保留来源与技能版本，不继承汇总尺寸',async()=>{
   const f=await setup();try{

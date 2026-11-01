@@ -19,6 +19,7 @@ Desktop.ini
 *.zip
 # Do not commit browser profiles or credentials even if copied outside data/
 **/browser-profile/
+**/chatgpt-browser-profile/
 **/auth.json
 **/cookies.json
 **/storage-state.json

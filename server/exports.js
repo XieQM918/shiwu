@@ -3,14 +3,15 @@ import archiver from 'archiver';
 import path from 'node:path';
 import { access } from 'node:fs/promises';
 import { FIELD_DEFS,fieldLabel } from './domain.js';
+import {weightParts} from './weight.js';
 import {cleanDownloadFiles} from './download-cleaner.js';
 
 const states={queued:'等待采集',running:'采集中',waiting:'等待验证',paused:'已暂停',stopped:'已停止',done:'已采集',partial:'部分采集',failed:'采集失败'};
 const categories={main:'01-主图',sku:'02-规格图',detail:'03-详情图'};
 const baseColumns=[{header:'商品编号',key:'id',width:22},{header:'商品名称',key:'title',width:45},{header:'商品链接',key:'url',width:55},{header:'供应商',key:'supplier',width:28}];
 const visibleFields=FIELD_DEFS.filter(([key])=>!key.startsWith('package'));
-const valueColumns=visibleFields.map(([key,label,unit])=>({header:`${label}${unit?`（${unit}）`:''}`,key,width:key==='material'?25:18}));
-function values(fields){return Object.fromEntries(visibleFields.map(([key])=>[key,fieldLabel(fields?.[key])]));}
+const valueColumns=visibleFields.map(([key,label,unit])=>({header:`${label}${unit?`（${unit}）`:''}`,key,width:key==='material'?25:18})).concat([{header:'净重（lb整数）',key:'weightLb',width:18},{header:'净重（剩余oz）',key:'weightOz',width:18}]);
+function values(fields){const raw=Object.fromEntries(visibleFields.map(([key])=>[key,fieldLabel(fields?.[key])]));const w=fields?.weight;const p=w?.status!=='variants'?weightParts(w?.value):null;return {...raw,weightLb:p?p.lb:fieldLabel(w),weightOz:p?(p.oz.startsWith('<')?p.oz:Number(p.oz)):fieldLabel(w)};}
 function sources(fields){return visibleFields.map(([key,label])=>{const f=fields?.[key];if(!f || f.status==='missing')return '';return `${label}: ${f.status==='manual'?'[人工修改] ':''}${f.raw||''} ${(f.sources||[]).map(s=>`[${s.kind==='ocr'?'图片识别':'网页'}${s.imageId?':'+s.imageId:''}] ${s.text||''}`).join(' | ')}`;}).filter(Boolean).join('\n');}
 export async function workbookBuffer(products,listings=[]){
   const workbook=new ExcelJS.Workbook();workbook.creator='拾物 · 1688商品工作台';workbook.created=new Date();

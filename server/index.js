@@ -59,6 +59,9 @@ export function createApp({dataDir=path.join(ROOT,'data'),collectorFactory,store
   app.post('/api/products/:id/variants/:skuId/generate',async(req,res)=>{
     try{const job=await generation.create(req.params.id,req.params.skuId,{autoRepair:req.body.autoRepair===true});res.status(201).json({id:job.id});}catch(e){res.status(409).json({error:e.message});}
   });
+  app.post('/api/chatgpt/browser/open',async(req,res)=>{try{await generation.chatgpt.open();res.json(await generation.chatgpt.status());}catch(e){res.status(409).json({error:e.message});}});
+  app.get('/api/chatgpt/browser/status',async(req,res)=>{try{res.json(await generation.chatgpt.status());}catch(e){res.status(409).json({error:e.message});}});
+  app.patch('/api/generation-jobs/:id/evidence',async(req,res)=>{try{res.json(await generation.setEvidence(req.params.id,req.body.view,req.body.imageIds));}catch(e){res.status(409).json({error:e.message});}});
   app.get('/api/style-preferences',(req,res)=>res.json({preferences:generation.preferences()}));
   app.patch('/api/style-preferences/:id',(req,res)=>{try{res.json(generation.setPreference(req.params.id,req.body.enabled));}catch(e){res.status(400).json({error:e.message});}});
   app.patch('/api/generation-jobs/:id/options',async(req,res)=>{try{res.json(await generation.setOptions(req.params.id,req.body));}catch(e){res.status(400).json({error:e.message});}});
