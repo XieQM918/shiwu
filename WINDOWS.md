@@ -29,6 +29,7 @@ Windows原生Codex使用方式参见 [OpenAI Windows文档](https://learn.chatgp
 - **PowerShell提示不能加载npm.ps1：** 使用“命令提示符”，或使用`npm.cmd`；无需放宽PowerShell执行策略。
 - **Python未找到：** 确认安装了Python和启动器，运行`py -3 --version`。必要时将环境变量`WORKBENCH_PYTHON`指向真实的python.exe。Windows应用商店占位命令不等于已经安装Python。
 - **清理工具缺失：** 在工程目录执行 `npm.cmd ci --include=optional` 后重新启动。若公司防护软件隔离ExifTool，请按公司的处理流程解决，工作台不会关闭防护或提供未经清理的图片冒充成功。
+- **中文目录中的清理工具：** 程序自动使用Windows短路径，必要时将ExifTool组件复制到当前用户的英文临时目录；图片和资料不搬动。若系统关闭短路径且用户临时目录也不能使用，可把工程放在`C:\Work\shiwu`，或将`WORKBENCH_TOOLS_DIR`设置为自己可写的现有英文目录。
 - **Codex未找到：** 重新安装官方CLI。工作台支持npm的Windows命令入口，也支持用`WORKBENCH_CODEX_BIN`指定codex.exe或官方codex.js；无需共享别人的账号文件。
 - **已登录但生图不可用／额度不足：** 打开具体任务查看原因。账号、模型和工具可用性取决于本机实际环境，不自动改用收费图片API。
 - **本机识别结果不准确：** Windows和Mac使用不同识别引擎，个别数字或汉字可能不同。保留来源核对；尺寸标注与原文不一致时仍标待确认，不猜小数点或尺寸方向。

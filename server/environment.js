@@ -4,6 +4,7 @@ import {access} from 'node:fs/promises';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {runtimeEnv,findExecutable,codexLaunch,imageCodexExecutable,pythonLaunch,bundledSkillPath} from './platform.js';
+import {metadataToolEnv} from './metadata-tool.js';
 const exec=promisify(execFile);
 const get=(env,name)=>env[Object.keys(env).find(k=>k.toLowerCase()===name.toLowerCase())]||'';
 export function chromeCandidates({platform=process.platform,env=process.env}={}){
@@ -13,7 +14,8 @@ export function chromeCandidates({platform=process.platform,env=process.env}={})
   return ['/usr/bin/google-chrome','/usr/bin/google-chrome-stable'];
 }
 export async function inspectEnvironment({root=path.resolve(import.meta.dirname,'..'),checkLogin=true}={}){
-  const env=runtimeEnv(process.env,{root}),checks=[];const add=(id,label,status,message)=>checks.push({id,label,status,message});
+  let env=runtimeEnv(process.env,{root}),metadataProblem;try{env=await metadataToolEnv({root});}catch(e){metadataProblem=e.message;}
+  const checks=[];const add=(id,label,status,message)=>checks.push({id,label,status,message});
   add('node','Node.js',Number(process.versions.node.split('.')[0])>=24?'ok':'error',`当前 ${process.version}，需要24或更高版本。`);
   const chrome=chromeCandidates().find(file=>existsSync(file));add('chrome','Google Chrome',chrome?'ok':'error',chrome?'已找到本机浏览器；1688使用本工程独立登录资料。':'请安装Google Chrome，或配置 WORKBENCH_BROWSER_EXECUTABLE。');
   try{await access(bundledSkillPath(root));await access(path.join(path.dirname(bundledSkillPath(root)),'references/scene-guide.md'));add('skill','Etsy 生图 Skill','ok','工程已包含Skill与摄影参考，不依赖原作者电脑目录。');}catch{add('skill','Etsy 生图 Skill','error','随工程的Skill或参考文件缺失，请重新下载完整工程。');}
@@ -21,7 +23,7 @@ export async function inspectEnvironment({root=path.resolve(import.meta.dirname,
     if(!existsSync('/usr/bin/xcrun'))throw new Error('需要Apple命令行工具。');add('ocr','本机图片文字识别','ok','使用macOS Vision。首次识别时准备本机组件。');
   }else{const {modelFile}=await import('./portable-ocr.js');await Promise.all(['chi_sim','eng'].map(code=>access(modelFile(code))));add('ocr','本机图片文字识别','ok','本机OCR及中英文模型已安装；识别不上传图片，不使用付费接口。');}}catch{add('ocr','本机图片文字识别','error','OCR组件未就绪，请在工程目录运行 npm ci --include=optional。');}
   try{const py=await pythonLaunch({env});add('python','图片下载清理 · Python','ok',`已找到Python 3（${path.basename(py.command)}）。`);}catch(e){add('python','图片下载清理 · Python','error',e.message);}
-  const exiftool=findExecutable('exiftool',{env});if(exiftool){try{const {stdout}=await exec(exiftool,['-config','','-ver'],{env,timeout:10000,windowsHide:true});add('exiftool','图片下载清理 · ExifTool','ok',`ExifTool ${stdout.trim().slice(0,30)} 已就绪。`);}catch{add('exiftool','图片下载清理 · ExifTool','error','ExifTool无法运行；请重装可选依赖或将有效ExifTool加入PATH。');}}else add('exiftool','图片下载清理 · ExifTool','error',process.platform==='win32'?'请运行 npm ci --include=optional，安装Windows下载清理组件。':'请安装ExifTool并加入PATH。');
+  const exiftool=findExecutable('exiftool',{env});if(metadataProblem)add('exiftool','图片下载清理 · ExifTool','error',metadataProblem);else if(exiftool){try{const {stdout}=await exec(exiftool,['-config','','-ver'],{env,timeout:10000,windowsHide:true});add('exiftool','图片下载清理 · ExifTool','ok',`ExifTool ${stdout.trim().slice(0,30)} 已就绪。`);}catch{add('exiftool','图片下载清理 · ExifTool','error','ExifTool无法运行；请重装可选依赖或将有效ExifTool加入PATH。');}}else add('exiftool','图片下载清理 · ExifTool','error',process.platform==='win32'?'请运行 npm ci --include=optional，安装Windows下载清理组件。':'请安装ExifTool并加入PATH。');
   try{const launch=codexLaunch();await exec(launch.command,[...launch.args,'--version'],{env,timeout:15000,windowsHide:true});add('codex','本机 Codex','ok','已找到Codex；使用此电脑当前用户自己的账号。');
     if(checkLogin){try{const {stdout,stderr}=await exec(launch.command,[...launch.args,'login','status'],{env,timeout:15000,windowsHide:true});const text=stdout+' '+stderr;
       add('login','GPT 账号登录',/api.?key/i.test(text)?'warning':'ok',/api.?key/i.test(text)?'当前是API密钥登录；本工作台默认使用ChatGPT账号，请运行 codex login 切换。':'本机已登录。生图功能及额度以此账号实际可用能力为准。');

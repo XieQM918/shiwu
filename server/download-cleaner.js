@@ -3,7 +3,8 @@ import {promisify} from 'node:util';
 import {mkdtemp,mkdir,copyFile,stat,rm,realpath} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {pythonLaunch,runtimeEnv} from './platform.js';
+import {pythonLaunch} from './platform.js';
+import {metadataToolEnv} from './metadata-tool.js';
 const exec=promisify(execFile);
 const SCRIPT=path.resolve(import.meta.dirname,'../skills/clean-image-metadata/scripts/clean_metadata.py');
 
@@ -20,7 +21,7 @@ export async function cleanDownloadFiles(entries,{script=SCRIPT,python}={}){
       await copyFile(entry.file,path.join(input,name));names.push(name);
     }
     let stdout;
-    const env={...runtimeEnv(),PYTHONIOENCODING:'utf-8'};const launch=await pythonLaunch({env,executable:python});
+    const env={...await metadataToolEnv(),PYTHONIOENCODING:'utf-8'};const launch=await pythonLaunch({env,executable:python});
     try{({stdout}=await exec(launch.command,[...launch.args,script,input],{env,windowsHide:true,timeout:300000,maxBuffer:4*1024*1024}));}
     catch(e){if(e.code===1&&e.stdout)stdout=e.stdout;else{
       let reason;try{reason=JSON.parse(e.stdout).error;}catch{}

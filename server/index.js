@@ -16,6 +16,7 @@ import {ListingService} from './listing.js';
 import {bundledSkillPath} from './platform.js';
 import {inspectEnvironment} from './environment.js';
 import {CODEX_IMAGE_MODEL,IMAGE_REASONING_EFFORT} from './image-model.js';
+import {closeMetadataTools} from './metadata-tool.js';
 
 export const ROOT=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 export function createApp({dataDir=path.join(ROOT,'data'),collectorFactory,store:providedStore,generationFactory,listingFactory,linkResolver,outputRoot=path.join(ROOT,'output/etsy-accessory-images'),listingOutputRoot=path.join(ROOT,'output/etsy-listings')}={}){
@@ -143,7 +144,7 @@ async function start(){
   const port=Number(process.env.WORKBENCH_PORT||3210);
   const server=app.listen(port,'127.0.0.1',()=>console.log(`拾物工作台已启动：http://127.0.0.1:${port}`));
   server.on('error',e=>{console.error(e.code==='EADDRINUSE'?`端口${port}已被占用，请检查工作台是否已启动。`:e.message);process.exit(1);});
-  const shutdown=async()=>{await Promise.all([generation.close(),listing.close(),collector.close()]);await ocr.close?.();server.close();store.close();process.exit(0);};
+  const shutdown=async()=>{await Promise.all([generation.close(),listing.close(),collector.close()]);await ocr.close?.();await closeMetadataTools();server.close();store.close();process.exit(0);};
   process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url))start().catch(e=>{console.error(e.message);process.exit(1);});

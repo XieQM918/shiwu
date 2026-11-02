@@ -6,6 +6,7 @@ import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import net from 'node:net';
 import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
 import {runtimeEnv,pythonLaunch,findExecutable} from '../server/platform.js';
 const exec=promisify(execFile),root=path.resolve(import.meta.dirname,'..'),env=runtimeEnv();
 await exec(process.execPath,['scripts/package-project.mjs'],{cwd:root,env,timeout:60000});
@@ -39,6 +40,12 @@ try{
     if(executable)try{await exec(executable,['-config','','-ver'],{cwd:directory,env:runtimeEnv(process.env,{root:directory}),timeout:15000});}catch(e){diagnostic+='\n'+(e.stderr||e.message);}
     assert.fail('首次安装后的下载清理工具未就绪：'+diagnostic);
   }
+  const {cleanDownloadFiles}=await import(pathToFileURL(path.join(directory,'server/download-cleaner.js')).href);
+  const {closeMetadataTools}=await import(pathToFileURL(path.join(directory,'server/metadata-tool.js')).href);
+  try{
+    const cleaned=await cleanDownloadFiles([{file:path.join(directory,'test/fixtures/brooch-parameter-card.jpg'),name:'fixture.jpg'}]);
+    try{assert.equal(cleaned.report.success,1);assert.equal(cleaned.report.failed,0);assert.ok((await readFile(cleaned.files[0].file)).length>1000);}finally{await cleaned.cleanup();}
+  }finally{await closeMetadataTools();}
   const sources=JSON.parse(await readFile(path.join(directory,'工程文件清单.json'),'utf8'));assert.ok(sources.files.every(f=>!f.path.startsWith('data/')&&!f.path.startsWith('output/')));
   console.log(`首次启动验证通过（${process.platform}）：工程ZIP解压到中文、空格和&目录，自动安装依赖、构建、启动，本机空资料库及GPT-6.1 Sol配置正确；未登录账号、未调用生图。`);
 }finally{
