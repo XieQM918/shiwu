@@ -32,7 +32,9 @@ async function main(){
   if(mode==='login'){const launch=codexLaunch();await run(launch.command,[...launch.args,'login']);return;}
   if(mode!=='start')throw new Error('未知启动方式。');
   const {inspectEnvironment}=await import('../server/environment.js');const report=await inspectEnvironment({checkLogin:false});for(const c of report.checks.filter(c=>c.status!=='ok'))console.log(`${c.label}：${c.message}`);
-  await npm(['run','build']);
+  // npm's Windows .bin shim can split an & in the project directory. Invoke
+  // Vite's JavaScript entry directly, preserving the path as a single argument.
+  await run(process.execPath,[path.join(root,'node_modules','vite','bin','vite.js'),'build']);
   console.log(`\n工作台运行期间请保留此窗口。浏览器地址：${url}\n按Ctrl+C停止。`);
   const child=spawn(process.execPath,['server/index.js'],{cwd:root,env,stdio:'inherit',windowsHide:false});child.on('error',e=>{console.error(e.message);process.exitCode=1;});
   let exited=false;child.on('exit',code=>{exited=true;process.exitCode=code||0;});

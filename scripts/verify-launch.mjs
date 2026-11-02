@@ -6,7 +6,7 @@ import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import net from 'node:net';
 import assert from 'node:assert/strict';
-import {runtimeEnv,pythonLaunch} from '../server/platform.js';
+import {runtimeEnv,pythonLaunch,findExecutable} from '../server/platform.js';
 const exec=promisify(execFile),root=path.resolve(import.meta.dirname,'..'),env=runtimeEnv();
 await exec(process.execPath,['scripts/package-project.mjs'],{cwd:root,env,timeout:60000});
 const temporary=await mkdtemp(path.join(os.tmpdir(),'shiwu 首次启动 & 验证-'));
@@ -31,6 +31,14 @@ try{
   const config=await fetch(base+'/api/generation/config').then(r=>r.json());assert.equal(config.provider,'codex');assert.equal(config.requestedModel,'gpt-6.1-sol');
   const state=await fetch(base+'/api/state').then(r=>r.json());assert.equal(state.products.length,0);assert.equal(state.generationJobs.length,0);
   const html=await fetch(base).then(r=>r.text());assert.match(html,/assets\/index-/);await access(path.join(directory,'data/dependency-lock.sha256'));
+  const environment=await fetch(base+'/api/environment').then(r=>r.json());
+  const cleaner=environment.checks.find(c=>c.id==='exiftool');
+  if(cleaner?.status!=='ok'){
+    const executable=findExecutable('exiftool',{env:runtimeEnv(process.env,{root:directory})});
+    let diagnostic=cleaner?.message||'ExifTool missing';
+    if(executable)try{await exec(executable,['-config','','-ver'],{cwd:directory,env:runtimeEnv(process.env,{root:directory}),timeout:15000});}catch(e){diagnostic+='\n'+(e.stderr||e.message);}
+    assert.fail('首次安装后的下载清理工具未就绪：'+diagnostic);
+  }
   const sources=JSON.parse(await readFile(path.join(directory,'工程文件清单.json'),'utf8'));assert.ok(sources.files.every(f=>!f.path.startsWith('data/')&&!f.path.startsWith('output/')));
   console.log(`首次启动验证通过（${process.platform}）：工程ZIP解压到中文、空格和&目录，自动安装依赖、构建、启动，本机空资料库及GPT-6.1 Sol配置正确；未登录账号、未调用生图。`);
 }finally{
