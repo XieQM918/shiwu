@@ -9,6 +9,7 @@
     "start": "node server/index.js",
     "test": "node --test test/*.test.js",
     "test:ui": "node scripts/verify-ui.mjs",
+    "test:launch": "node scripts/verify-launch.mjs",
     "doctor": "node scripts/doctor.mjs",
     "launch": "node scripts/launch.mjs start",
     "login:gpt": "node scripts/launch.mjs login",

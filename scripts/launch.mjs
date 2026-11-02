@@ -21,7 +21,7 @@ async function prepare(){
   }
 }
 async function healthy(url){try{const r=await fetch(url+'/api/health',{signal:AbortSignal.timeout(1200)});return r.ok&&(await r.json()).app==='1688-workbench';}catch{return false;}}
-function open(url){const command=process.platform==='darwin'?'open':process.platform==='win32'?'rundll32.exe':'xdg-open';const args=process.platform==='win32'?['url.dll,FileProtocolHandler',url]:[url];const child=spawn(command,args,{env,stdio:'ignore',windowsHide:true});child.on('error',()=>console.log('请用浏览器打开 '+url));child.unref();}
+function open(url){if(env.WORKBENCH_OPEN_BROWSER==='0')return;const command=process.platform==='darwin'?'open':process.platform==='win32'?'rundll32.exe':'xdg-open';const args=process.platform==='win32'?['url.dll,FileProtocolHandler',url]:[url];const child=spawn(command,args,{env,stdio:'ignore',windowsHide:true});child.on('error',()=>console.log('请用浏览器打开 '+url));child.unref();}
 async function main(){
   if(Number(process.versions.node.split('.')[0])<24)throw new Error('需要Node.js 24或更高版本，请先安装后重新打开启动入口。');
   const port=Number(env.WORKBENCH_PORT||3210);if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('工作台端口需在1024–65535之间。');const url=`http://127.0.0.1:${port}`;

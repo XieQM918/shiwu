@@ -6,7 +6,7 @@
 
 1. 安装 [Node.js 24或更高版本](https://nodejs.org/)、[Google Chrome](https://www.google.com/chrome/) 和 [Python 3.9或更高版本](https://www.python.org/downloads/windows/)。Python安装时勾选启动器及加入PATH，安装后重新打开终端。
 2. 从本仓库点击 **Code → Download ZIP** 并解压，或使用Git克隆。进入包含本文件和`package.json`的目录，不要在压缩包内直接启动。
-3. 在命令提示符运行 `npm.cmd install -g @openai/codex`。然后双击 **登录GPT-Windows.cmd**，使用你自己的ChatGPT账号登录。首次会安装项目组件、中英文识别模型和Windows下载清理工具。
+3. 在命令提示符运行 `npm.cmd install -g @openai/codex@latest`。然后双击 **登录GPT-Windows.cmd**，使用你自己的ChatGPT账号登录。首次会安装项目组件、中英文识别模型和Windows下载清理工具。
 4. 双击 **启动工作台-Windows.cmd**（或`start-workbench.cmd`），等待自动打开浏览器。保持启动窗口运行。遇到问题可双击 **环境检查-Windows.cmd**。
 5. 在工作台点击 **登录 / 查看1688**，在独立采集窗口登录你自己的1688账号。遇到验证码由本人完成，再回工作台继续。
 
@@ -22,9 +22,10 @@
 
 - 批量采集1–30个1688商品；支持标准、手机端和分享短链，保存原图并分开显示规格与参数依据。
 - 图片文字识别在本机执行：Mac使用Vision；Windows使用Tesseract及随npm依赖安装的中英文模型。仅采集/OCR不调用付费AI接口。
-- 每个规格默认最多6张Etsy图片：使用主图1、完整外观1、不同角度3（正面/侧面/背面）、手持尺度1。指定视角缺少原图依据则跳过，不凑图。每张使用独立短会话，默认仅生一稿；任务内可查看调用与用量。旧批次与单张修改版本保留。
-- 每个商品生成英文标题、描述、建议标签与中文核对说明。新图片批次通过专用ChatGPT会员网页操作，不启动Codex图片任务、不使用付费图片API；文案仍通过本机已登录Codex调用。可用功能、额度及生图工具以各自账号实际能力为准；登录成功不等于保证可生图。
-- 图片生成前，在「环境检查」或生图面板点击「登录 / 查看ChatGPT」，用自己的会员账号登录。仅在网页明确提供GPT-6 Luna时提交；桌面Codex中的模型列表不等于网页模型列表。网页验证、额度限制或结构变化时暂停，请本人处理后继续。
+- 每个规格默认最多6张Etsy图片：使用主图1、完整外观1、原素材视角最多3、手持尺度1。角度图从当前规格原图及匹配后的共用详情图选取实际斜拍、俯拍等非正视角，抠出商品后沿用 Etsy 摄影风格；不要求固定侧背视角，不推造新角度，不足3个明确显示缺口。每张使用独立短会话，默认仅生一稿；任务内可查看调用与用量。旧批次与单张修改版本保留。
+- 每个商品生成英文标题、描述、建议标签与中文核对说明。图片生成已切回本机Codex，固定请求 `gpt-6.1-sol`、低推理；上架文案沿用原方式。使用各自电脑的账号，不新增付费图片API。
+- 不需要ChatGPT网页登录或浏览器连接扩展。网页方案已停用，历史结果保留。新任务每张使用独立短会话，默认最多调用生图一次；角度场景先用一次低推理分析选择原素材视角，缓存裁切方案；后续每张仅传入选中的高清原图裁切。找不到来源的角度位不调用生图，选角用量单独计入本批汇总。
+- Mac优先使用已安装桌面App内置的新Codex入口；Windows使用自己的本机Codex。找不到GPT-6.1 Sol时请更新Codex或设置 `WORKBENCH_IMAGE_CODEX_BIN`，程序不回退5.6或其他模型。模型目录及会话实际回显均需确认gpt-6.1-sol后才可生成。
 - 净重保留g，并显示整数lb＋剩余oz；Excel保留克重并增加两列。
 - 图片与文案可通过小型“修改”按钮输入要求，保留历史版本；长期偏好须在“修改审阅中心”确认才生效。
 - Excel导出已采用的文案及商品/规格表；下载图片自动运行随工程携带的元数据清理Skill。清理文件内来源信息，不处理可见Logo或像素隐形水印。
@@ -39,4 +40,4 @@
 
 上传与协作步骤见 [GitHub分发说明](GITHUB.md)，验证范围见 [兼容性记录](COMPATIBILITY.md)。
 
-开发命令：`npm ci --include=optional`、`npm run build`、`npm start`。环境检查：`npm run doctor`。测试：`npm test`、`npm run test:ui`。分享前检查：`npm run check:share`。生成不含本机资料的工程包：`npm run package:project`。
+开发命令：`npm ci --include=optional`、`npm run build`、`npm start`。环境检查：`npm run doctor`。测试：`npm test`、`npm run test:ui`、`npm run test:launch`（解压工程后首次安装启动测试，需联网）。分享前检查：`npm run check:share`。生成不含本机资料的工程包：`npm run package:project`。

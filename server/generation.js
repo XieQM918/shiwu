@@ -5,13 +5,16 @@ import os from 'node:os';
 import {spawn} from 'node:child_process';
 import archiver from 'archiver';
 import {cleanDownloadFiles} from './download-cleaner.js';
-import {ChatGPTBrowser,ChatGPTImageRunner} from './chatgpt-web.js';
+import {CODEX_IMAGE_MODEL,IMAGE_REASONING_EFFORT} from './image-model.js';
+import {imageCodexExecutable} from './platform.js';
 import {CodexClient,finalJson} from './codex-client.js';
 import {freezeInput,planCandidates,confirmedField,candidateInput,RESULT_SCHEMA,containedFile,hashBuffer,profileKey} from './generation-input.js';
+import {SOURCE_ANGLE_MODE,ANGLE_SOURCE_SCHEMA,angleRefs,anglePlanKey,selectionPreviewInput,materializeAnglePlan,readAnglePlan,saveAnglePlan} from './angle-sources.js';
 
 const ACTIVE=['queued','running'];
 export function usageSummary(job){
-  const records=job.candidates.flatMap(c=>c.usageHistory||[]);
+  const selection=job.anglePlan?.jobId===job.id&&job.anglePlan.usage?[job.anglePlan.usage]:[];
+  const records=[...job.candidates.flatMap(c=>c.usageHistory||[]),...selection].sort((a,b)=>(a.startedAt||'').localeCompare(b.startedAt||''));
   if(!records.length)return null;
   const known=records.filter(r=>r.tokensKnown);
   return {recordedTurns:records.length,tokenRecordedTurns:known.length,...Object.fromEntries(['inputTokens','cachedInputTokens','outputTokens','reasoningOutputTokens','totalTokens','imageCalls','imageViews','commands','durationMs'].map(k=>[k,records.reduce((n,r)=>n+(Number(r[k])||0),0)])),quotaBefore:records[0].quotaBefore||null,quotaAfter:records.at(-1).quotaAfter||null};
@@ -23,7 +26,7 @@ export function imageJobSummary(job){
     blocked:job.candidates.filter(c=>c.status==='blocked').length,failed:job.candidates.filter(c=>c.status==='failed').length,
     previews:job.candidates.filter(c=>c.preview&&c.status!=='completed').length,
     kind:job.kind||'batch',parentJobId:job.parentJobId,parentCandidateId:job.parentCandidateId,
-    provider:job.provider||'codex',waitReason:job.waitReason||null,usage:job.usage||null,planVersion:job.planVersion||1,
+    provider:job.provider||'codex',requestedModel:job.requestedModel||null,waitReason:job.waitReason||null,usage:job.usage||null,planVersion:job.planVersion||1,
     current:job.candidates.find(c=>c.status==='running')?.id||null};
 }
 export function imageType(buffer){
@@ -41,27 +44,66 @@ export class CodexImageRunner {
       // Let the display sleep while keeping an explicitly started batch running.
       this.keepAwake=spawn('/usr/bin/caffeinate',['-i','-w',String(process.pid)],{stdio:'ignore'});this.keepAwake.on('error',()=>{});
     }
-    this.client=this.clientFactory({cwd:batchDir});await this.client.connect();
+    this.client=this.clientFactory({cwd:batchDir,executable:imageCodexExecutable()});await this.client.connect();
     const models=await this.client.request('model/list',{includeHidden:false});
-    const selected=models.data?.find(m=>m.isDefault)||models.data?.[0];
-    if(!selected)throw new Error('当前 Codex 账号没有可用模型，请检查本机登录状态。');
+    const requested=job.requestedModel||CODEX_IMAGE_MODEL;
+    if(requested!==CODEX_IMAGE_MODEL)throw new Error('此为历史模型批次，请重新生成以使用 '+CODEX_IMAGE_MODEL+'。');
+    const selected=models.data?.find(m=>(m.model||m.id)===requested);
+    if(!selected)throw new Error('当前Codex入口未提供 GPT-6.1 Sol。请升级Codex或设置 WORKBENCH_IMAGE_CODEX_BIN；不回退5.6或其他模型。');
     this.model=selected.model||selected.id;
     const instructions='你只负责当前一张商品摄影，使用独立短会话，不需要前面成品的历史。原图已在输入展示，不重复打开；Skill/指南至多各读取一次，风格参考最多一张。快速出图并做一次简短核对，默认不自动重画，不写长篇分析。内置生图返回图片已在视觉上下文中时不再重复view_image。只在当前任务目录保存，不改代码、设置、不读凭据、不发消息、不创建子代理；缺少指定视角依据时直接返回blocked，不耗费生图。';
     this.instructions=instructions;
     // A fresh runtime thread on recovery avoids accidentally continuing an interrupted tool call.
-    this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:instructions,model:this.model});
+    this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:instructions,model:this.model,expectedModel:this.model});
     onEvent({threadId:this.threadId,model:this.model});return this.threadId;
   }
-  async generate(job,candidate,batchDir,{signal,onEvent}){
+  async prepareSourceAngles(job,batchDir,{signal,onEvent}){
+    for(const ref of angleRefs(job.snapshot))if(hashBuffer(await readFile(await containedFile(batchDir,ref.path)))!==ref.hash)throw new Error('冻结的选角原图发生变化，请新建批次。');
+    let plan=await readAnglePlan(job.snapshot,batchDir);
+    if(!plan){
+      onEvent({message:'正在一次性选择原素材视角（不生图，后续复用选角结果）'});
+      const threadId=await this.client.startThread({cwd:batchDir,model:this.model,expectedModel:this.model,developerInstructions:'仅分析已附商品照片，返回指定JSON。不调用工具、不生图、不执行命令、不创建代理。仅识别实际拍到的视角与裁切区域，不推造新视角。'});
+      onEvent({threadId});
+      const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)controller.abort();
+      let forbidden=false,result;
+      try{
+        result=await this.client.runTurn({threadId,input:await selectionPreviewInput(job.snapshot,batchDir),outputSchema:ANGLE_SOURCE_SCHEMA,effort:IMAGE_REASONING_EFFORT,collectUsage:true,signal:controller.signal,timeoutMs:180000,timeoutMessage:'原素材选角超时；已暂停，继续时可重试。',onEvent:event=>{
+          if(event.method==='item/started'&&['imageGeneration','mcpToolCall','commandExecution','fileChange','collabAgentToolCall','webSearch'].includes(event.params?.item?.type)){forbidden=true;controller.abort();}
+        }});
+        if(forbidden)throw new Error('选角任务请求了不允许的工具；未进入角度生图。');
+        const answer=finalJson(result);
+        plan=await materializeAnglePlan(job.snapshot,answer,batchDir,{jobId:job.id,model:this.model,usage:result.usage?{...result.usage,purpose:'angle_source_selection'}:null});
+      }catch(error){
+        if(signal?.aborted){if(error.usage)error.usage.purpose='angle_source_selection_interrupted';throw error;}
+        // Persist a failed selection once: A/B/C must not each rerun the same
+        // analysis. Only an explicit retry can discard this failed plan.
+        plan={key:anglePlanKey(job.snapshot),jobId:job.id,model:this.model,createdAt:new Date().toISOString(),scanned:angleRefs(job.snapshot).length,selectionFailed:true,
+          usage:error.usage||result?.usage||null,slots:['A','B','C'].map(letter=>({letter,status:'blocked',reason:'原素材选角未完成：'+(forbidden?'选角请求了不允许的工具。':error.message)}))};
+        await saveAnglePlan(batchDir,plan);onEvent({anglePlan:plan});
+        const wait=new Error(plan.slots[0].reason);wait.waitReason='angle_selection';throw wait;
+      }finally{signal?.removeEventListener('abort',abort);}
+    }
+    onEvent({anglePlan:plan});
+    if(plan.selectionFailed){const e=new Error(plan.slots[0].reason);e.waitReason='angle_selection';throw e;}
+    return plan;
+  }
+  async generate(job,candidate,batchDir,{signal,onEvent=()=>{}}={}){
+    if(candidate.view==='source'){
+      const plan=await this.prepareSourceAngles(job,batchDir,{signal,onEvent});
+      const source=candidate.angleSource||plan.slots.find(s=>s.letter===candidate.letter);
+      if(!source||source.status!=='ready')return {status:'blocked',reason:source?.reason||'原素材没有更多可用的非正视角，未调用生图。',attempts:0};
+      candidate={...candidate,angleSource:source};onEvent({angleSource:source});
+    }
+    if(['side','back'].includes(candidate.view)&&!job.viewEvidence?.[candidate.view]?.length)return {status:'blocked',reason:'当前规格缺少已确认的'+candidate.viewLabel+'原图，未调用生图。',attempts:0};
     for(const ref of [...job.snapshot.refs,...job.snapshot.styleRefs]){
       if(ref.hash&&hashBuffer(await readFile(await containedFile(batchDir,ref.path)))!==ref.hash)throw new Error('冻结的参考图片发生变化，请重新建立批次。');
     }
     if(hashBuffer(await readFile(path.join(batchDir,job.snapshot.skill.path)))!==job.snapshot.skill.sha256)throw new Error('冻结的 Skill 版本发生变化，请重新建立批次。');
     // Never replay the previous generated images into the next photograph.
-    if(this.usedThread){this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:this.instructions,model:this.model});onEvent({threadId:this.threadId});}
+    if(this.usedThread){this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:this.instructions,model:this.model,expectedModel:this.model});onEvent({threadId:this.threadId});}
     this.usedThread=true;
     const attempts=new Set(),previewTasks=[];const maxAttempts=job.options?.autoRepair?3:1;
-    const result=await this.client.runTurn({threadId:this.threadId,input:candidateInput(job,candidate,batchDir),outputSchema:RESULT_SCHEMA,signal,collectUsage:true,onEvent:event=>{
+    const result=await this.client.runTurn({threadId:this.threadId,input:candidateInput(job,candidate,batchDir),outputSchema:RESULT_SCHEMA,signal,effort:IMAGE_REASONING_EFFORT,collectUsage:true,onEvent:event=>{
       const item=event.params?.item;
       if(item?.type==='imageGeneration'){
         attempts.add(item.id);
@@ -89,7 +131,7 @@ export class CodexImageRunner {
     const output=await containedFile(resultsRoot,path.relative(resultsRoot,String(answer.path||'')));
     const info=await stat(output);if(!info.isFile()||info.size<1024)throw new Error('生成图片文件缺失或不完整');
     const buffer=await readFile(output);const hash=hashBuffer(buffer);
-    if([...job.snapshot.refs,...job.snapshot.styleRefs].some(r=>r.hash===hash))throw new Error('输出与输入参考图相同，未视为生成成品');
+    if([...angleRefs(job.snapshot),...job.snapshot.styleRefs,candidate.angleSource||{}].some(r=>r.hash===hash))throw new Error('输出与输入参考图相同，未视为生成成品');
     let viewed=false;
     const generatedRoot=path.resolve(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'generated_images');
     // The native tool supplies its returned image in the model's visual context.
@@ -113,13 +155,13 @@ export class CodexImageRunner {
     if(Math.abs(dimensions.width/dimensions.height-1)>.025)throw new Error('生成图片不是约定的方形，未列为合格成品');
     return {status:'completed',reason:answer.reason||'已查看并核对',recommendation:answer.recommendation||'',attempts:answer.attempts||1,
       file:`results/${filename}`,hash,bytes:info.size,width:dimensions.width,height:dimensions.height,reviewedAt:new Date().toISOString(),
-      generationEvidence:generation.map(i=>({id:i.id,status:i.status})),turnId:result.turnId,productBrief};
+      generationEvidence:generation.map(i=>({id:i.id,status:i.status})),turnId:result.turnId,productBrief,...(candidate.angleSource?{angleSource:candidate.angleSource}:{})};
   }
   async publishPreview(source,job,candidate,batchDir){
     const file=await realpath(source);const generatedRoot=await realpath(path.resolve(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'generated_images')).catch(()=>null);
     if(!(generatedRoot&&file.startsWith(generatedRoot+path.sep))&&!file.startsWith(await realpath(batchDir)+path.sep))throw new Error('预览文件超出允许范围');
     const buffer=await readFile(file);if(buffer.length<1024)throw new Error('图片尚未保存完整');
-    const hash=hashBuffer(buffer);if(job.snapshot.refs.some(r=>r.hash===hash))throw new Error('不能把原图作为预览');
+    const hash=hashBuffer(buffer);if([...angleRefs(job.snapshot),candidate.angleSource||{}].some(r=>r.hash===hash))throw new Error('不能把原图作为预览');
     const ext=imageType(buffer);const relative=`drafts/${candidate.filename}-${hash.slice(0,12)}.${ext}`;
     await mkdir(path.join(batchDir,'drafts'),{recursive:true});const target=path.join(batchDir,relative);await copyFile(file,target);
     const size=await this.ocr.dimensions(target);if(Math.min(size.width||0,size.height||0)<512)throw new Error('预览像素异常');
@@ -131,8 +173,9 @@ export class CodexImageRunner {
 export class GenerationService {
   constructor({store,dataDir,outputRoot,skillPath,ocr,review,runnerFactory=null}){
     Object.assign(this,{store,dataDir,outputRoot,skillPath,runnerFactory,review});
-    this.customRunner=Boolean(runnerFactory);this.chatgpt=new ChatGPTBrowser({dataDir});this.runnerFactory=runnerFactory||(()=>new ChatGPTImageRunner({browser:this.chatgpt}));
+    this.customRunner=Boolean(runnerFactory);this.runnerFactory=runnerFactory||(()=>new CodexImageRunner({ocr}));
     this.active=null;this.creating=new Map();this.closing=false;
+    if(!this.customRunner)for(const job of this.store.imageJobs())if(job.provider==='chatgpt_web'&&['queued','running','paused'].includes(job.status)){job.status='stopped';delete job.waitReason;job.message='网页生图方案已停用；保留历史，请重新生成以使用Codex GPT-6.1 Sol。';this.store.saveImageJob(job);}
   }
   summaries(){return this.store.imageJobs().map(imageJobSummary);}
   async create(productId,skuId,options={}){
@@ -142,7 +185,7 @@ export class GenerationService {
     try{return await pending;}finally{this.creating.delete(key);}
   }
   async createLocked(productId,skuId,options){
-    const existing=this.store.imageJobs().find(j=>j.productId===productId&&j.skuId===skuId&&(ACTIVE.includes(j.status)||j.provider==='chatgpt_web'&&j.waitReason&&j.status==='paused'));
+    const existing=this.store.imageJobs().find(j=>j.productId===productId&&j.skuId===skuId&&j.provider==='codex'&&j.requestedModel===CODEX_IMAGE_MODEL&&(ACTIVE.includes(j.status)||j.waitReason&&j.status==='paused'));
     if(existing)return existing;
     const product=this.store.product(productId);if(!product)throw new Error('商品不存在');
     if(['running','queued','waiting'].includes(product.status))throw new Error('请等待此商品采集完成后再生成');
@@ -153,7 +196,7 @@ export class GenerationService {
     const batchDir=path.join(this.outputRoot,directory);
     const snapshot=await freezeInput({product,variant,dataDir:this.dataDir,batchDir,skillPath:this.skillPath});
     await mkdir(path.join(batchDir,'results'),{recursive:true});
-    const job={provider:'chatgpt_web',requestedModel:'gpt-6-luna',viewEvidence:{},id,productId,skuId,createdAt,directory,snapshot,candidates:planCandidates(snapshot),planVersion:2,status:'queued',message:'已加入精简生图队列：最多6张，角度为正面/侧面/背面',threadIds:[],kind:'batch',options:{autoRepair:options?.autoRepair===true}};
+    const job={provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,angleMode:SOURCE_ANGLE_MODE,viewEvidence:{},id,productId,skuId,createdAt,directory,snapshot,candidates:planCandidates(snapshot),planVersion:3,status:'queued',message:'已加入Codex GPT-6.1 Sol队列：最多6张，原素材选角，每张一稿',threadIds:[],kind:'batch',options:{autoRepair:options?.autoRepair===true}};
     this.freezeRules(job);
     this.store.saveImageJob(job);this.kick();return job;
   }
@@ -185,13 +228,16 @@ export class GenerationService {
     const directory=path.join(path.dirname(parent.directory),`${createdAt.replace(/[:.]/g,'-')}-${idNew.slice(0,8)}-style`),batchDir=path.join(this.outputRoot,directory);
     const parentDir=await this.directory(parent);await mkdir(batchDir,{recursive:true});
     for(const folder of ['input','skill'])await cp(await containedFile(parentDir,folder),path.join(batchDir,folder),{recursive:true});
+    for(const folder of ['angle-input','angle-sources']){const source=await containedFile(parentDir,folder).catch(e=>{if(e.code==='ENOENT')return null;throw e;});if(source)await cp(source,path.join(batchDir,folder),{recursive:true});}
+    const sourcePlan=await readAnglePlan(parent.snapshot,parentDir);
+    if(sourcePlan)await saveAnglePlan(batchDir,sourcePlan);
     const buffer=await readFile(file),ext=imageType(buffer);const sourceFile=`input/style-target.${ext}`;await copyFile(file,path.join(batchDir,sourceFile));
     await mkdir(path.join(batchDir,'results'),{recursive:true});
     const snapshot=structuredClone(parent.snapshot);snapshot.fields={...snapshot.fields,...parent.confirmedUpdates};snapshot.frozenAt=createdAt;
-    const job={provider:'chatgpt_web',requestedModel:'gpt-6-luna',viewEvidence:structuredClone(parent.viewEvidence||{}),id:idNew,productId:parent.productId,skuId:parent.skuId,createdAt,directory,snapshot,kind:'adjustment',parentJobId:id,parentCandidateId:candidateId,
+    const job={provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,viewEvidence:structuredClone(parent.viewEvidence||{}),id:idNew,productId:parent.productId,skuId:parent.skuId,createdAt,directory,snapshot,kind:'adjustment',parentJobId:id,parentCandidateId:candidateId,
       adjustment:{instruction,sourceFile,sourceHash:hashBuffer(buffer),sourceImageHash:usePreview?original.preview.hash:original.hash},
-      planVersion:parent.planVersion||1,options:{autoRepair:false},status:'queued',message:'风格要求已记录，当前图片结束后优先调整',threadIds:[],
-      candidates:[{id:original.id,scene:original.scene,label:original.label,letter:original.letter,view:original.view,viewLabel:original.viewLabel,viewBrief:original.viewBrief,filename:original.filename,status:'pending',reason:'',attempts:0}]};
+      planVersion:parent.planVersion||1,angleMode:parent.angleMode,options:{autoRepair:false},status:'queued',message:'风格要求已记录，当前图片结束后优先调整',threadIds:[],
+      candidates:[{id:original.id,scene:original.scene,label:original.label,letter:original.letter,view:original.view,viewLabel:original.viewLabel,viewBrief:original.viewBrief,angleSource:original.angleSource,filename:original.filename,status:'pending',reason:'',attempts:0}]};
     this.freezeRules(job);
     if(this.review)job.feedbackId=this.review.imageCreated(job,parent,original).id;
     let root=parent;while(root.parentJobId)root=this.get(root.parentJobId);
@@ -223,7 +269,13 @@ export class GenerationService {
     // Wait for that flush, otherwise a quick "continue" can be silently discarded.
     if(this.active?.id===id){await this.active.finished;job=this.get(id);}
     if(job.status==='done')return job;
-    if(!this.customRunner&&job.provider!=='chatgpt_web')throw new Error('这是历史Codex批次；请重新生成以创建ChatGPT会员网页批次，不会自动继续消耗Codex额度。');
+    if(!this.customRunner&&(job.provider==='chatgpt_web'||job.requestedModel!==CODEX_IMAGE_MODEL))throw new Error('这是网页或历史模型批次；请重新生成以创建Codex GPT-6.1 Sol新批次，历史成品会保留。');
+    if(job.anglePlan?.selectionFailed){
+      const {unlink}=await import('node:fs/promises');await unlink(path.join(await this.directory(job),'angle-source-plan.json')).catch(e=>{if(e.code!=='ENOENT')throw e;});
+      // Keep failed selection usage in the audit trail when explicitly retrying.
+      if(job.anglePlan.usage){job.candidates.find(c=>c.scene==='angle').usageHistory||=[];job.candidates.find(c=>c.scene==='angle').usageHistory.push(job.anglePlan.usage);}
+      delete job.anglePlan;
+    }
     delete job.waitReason;
     const current=this.store.product(job.productId)?.variants.find(v=>v.id===job.skuId);
     const updates={};
@@ -233,11 +285,11 @@ export class GenerationService {
       job.confirmedUpdates={...job.confirmedUpdates,...updates};
       await writeFile(path.join(await this.directory(job),'input-updates.json'),JSON.stringify(job.confirmationHistory,null,2));
     }
-    const replanned=planCandidates({...job.snapshot,fields:{...job.snapshot.fields,...job.confirmedUpdates}},{legacy:!job.planVersion||job.planVersion<2});
+    const replanned=planCandidates({...job.snapshot,fields:{...job.snapshot.fields,...job.confirmedUpdates}},{legacy:!job.planVersion||job.planVersion<2,sourceAngles:job.angleMode===SOURCE_ANGLE_MODE});
     for(const c of job.candidates){
       if(c.status==='completed')continue;
       const fresh=replanned.find(p=>p.id===c.id);
-      if(job.provider==='chatgpt_web'&&['side','back'].includes(c.view)&&job.viewEvidence?.[c.view]?.length&&c.status==='blocked'){c.status='pending';c.reason='';}
+      if(['side','back'].includes(c.view)&&job.viewEvidence?.[c.view]?.length&&c.status==='blocked'){c.status='pending';c.reason='';}
       if(c.status==='blocked'&&fresh?.status!=='blocked'&&(retry||c.scene==='use'||c.scene==='scale')){c.status='pending';c.reason='';}
       if(retry&&c.status==='failed'){c.status='pending';c.reason='';}
     }
@@ -259,16 +311,29 @@ export class GenerationService {
     if(imageIds.some(id=>!job.snapshot.refs.some(r=>r.imageId===id)))throw new Error('只能使用本批当前规格原图');
     job.viewEvidence={...job.viewEvidence,[view]:[...new Set(imageIds)]};job.evidenceHistory||=[];job.evidenceHistory.push({view,imageIds:job.viewEvidence[view],at:new Date().toISOString()});await this.persist(job);return job;
   }
+  async sourceAngles(id){
+    let job=this.get(id);if(ACTIVE.includes(job.status))throw new Error('请先停止任务再应用新角度规则。');
+    if(this.active?.id===id){await this.active.finished;job=this.get(id);}
+    if(job.parentJobId)throw new Error('请在原始完整批次应用新规则。');
+    if(job.provider==='chatgpt_web'||job.requestedModel!==CODEX_IMAGE_MODEL)throw new Error('历史模型批次请点重新生成，新批次使用原素材视角。');
+    const fresh=planCandidates(job.snapshot);
+    for(const c of job.candidates.filter(c=>c.scene==='angle'&&c.status!=='completed')){
+      const next=fresh.find(f=>f.id===c.id);c.previousView={view:c.view,viewLabel:c.viewLabel,reason:c.reason};
+      Object.assign(c,{view:next.view,viewLabel:next.viewLabel,viewBrief:next.viewBrief,status:'pending',reason:''});
+    }
+    job.angleMode=SOURCE_ANGLE_MODE;job.planVersion=3;job.status='paused';delete job.waitReason;
+    job.message='未完成角度位已改为原素材视角；点击继续后选角，已完成图片保留。沿用本批冻结素材，重新生成可使用最新共用详情图。';await this.persist(job);return job;
+  }
   kick(){if(this.active||this.closing)return;queueMicrotask(()=>this.drain().catch(e=>{this.problem=e.message;}));}
   async drain(){
     if(this.active||this.closing)return;
-    if(this.store.imageJobs().some(j=>j.provider==='chatgpt_web'&&j.waitReason&&j.status==='paused'))return;
+    if(this.store.imageJobs().some(j=>j.waitReason&&j.status==='paused'&&(this.customRunner||j.provider==='codex')))return;
     const job=this.store.imageJobs().filter(j=>j.status==='queued').sort((a,b)=>(a.kind==='adjustment'?0:1)-(b.kind==='adjustment'?0:1)||a.createdAt.localeCompare(b.createdAt))[0];if(!job)return;
     const runner=this.runnerFactory();const active={id:job.id,job,controller:new AbortController(),runner};let yielded=false;
     active.finished=new Promise(resolve=>{active.resolve=resolve;});this.active=active;
     try{
       const dir=await this.directory(job);job.status='running';job.message=job.provider==='chatgpt_web'?'正在连接ChatGPT会员网页':'正在连接本机 Codex';await this.persist(job);
-      if(!this.customRunner&&job.provider!=='chatgpt_web')throw new Error('历史Codex批次不会自动执行；请新建ChatGPT网页批次。');
+      if(!this.customRunner&&(job.provider==='chatgpt_web'||job.requestedModel!==CODEX_IMAGE_MODEL))throw new Error('网页及历史模型批次不自动执行；请新建Codex GPT-6.1 Sol批次。');
       if(!job.rulesSnapshot)this.freezeRules(job);
       if(active.stop||this.closing)throw new Error('任务已停止');
       const threadId=await runner.open(job,dir,({model})=>{if(model)job.model=model;});if(threadId){job.threadIds.push(threadId);job.threadId=threadId;}await this.persist(job);
@@ -280,8 +345,10 @@ export class GenerationService {
         c.status='running';job.message=`${c.label} ${c.letter} · 正在生成`;await this.persist(job);
         const effective={...job,snapshot:{...job.snapshot,fields:{...job.snapshot.fields,...job.confirmedUpdates}}};
         try{
-          const result=await runner.generate(effective,c,dir,{signal:active.controller.signal,onEvent:({message,attempts,preview,threadId,usage,model})=>{
+          const result=await runner.generate(effective,c,dir,{signal:active.controller.signal,onEvent:({message,attempts,preview,threadId,usage,model,anglePlan,angleSource})=>{
             if(model)job.model=model;
+            if(angleSource)c.angleSource=angleSource;
+            if(anglePlan){job.anglePlan=anglePlan;job.usage=usageSummary(job);this.store.saveImageJob(job);}
             if(threadId){job.threadIds.push(threadId);job.threadId=threadId;}
             if(usage){c.usageHistory||=[];c.usageHistory.push(usage);job.usage=usageSummary(job);this.store.saveImageJob(job);}
             if(!active.stop&&!this.closing&&message){if(attempts)c.attempts=attempts;if(preview)c.preview=preview;job.message=`${c.label} ${c.letter} · ${message}`;this.store.saveImageJob(job);}
@@ -333,5 +400,5 @@ export class GenerationService {
     archive.append(JSON.stringify({task:imageJobSummary(job),candidates:job.candidates.map(({file,hash,...c})=>({...c,originalHash:hash,filename:cleaned.files.find(f=>f.candidate.id===c.id)?.file&&file?path.basename(file):null,metadataCleanup:cleaned.files.find(f=>f.candidate.id===c.id)?.cleaning||null})),skill:job.snapshot.skill.sha256},null,2),{name:'成品清单.json'});
     await archive.finalize();
   }
-  async close(){this.closing=true;if(this.active){this.active.controller.abort();this.active.runner.close();}while(this.active)await new Promise(r=>setTimeout(r,30));await this.chatgpt.close();}
+  async close(){this.closing=true;if(this.active){this.active.controller.abort();this.active.runner.close();}while(this.active)await new Promise(r=>setTimeout(r,30));}
 }

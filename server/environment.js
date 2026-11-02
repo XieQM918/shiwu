@@ -3,7 +3,7 @@ import {existsSync} from 'node:fs';
 import {access} from 'node:fs/promises';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {runtimeEnv,findExecutable,codexLaunch,pythonLaunch,bundledSkillPath} from './platform.js';
+import {runtimeEnv,findExecutable,codexLaunch,imageCodexExecutable,pythonLaunch,bundledSkillPath} from './platform.js';
 const exec=promisify(execFile);
 const get=(env,name)=>env[Object.keys(env).find(k=>k.toLowerCase()===name.toLowerCase())]||'';
 export function chromeCandidates({platform=process.platform,env=process.env}={}){
@@ -27,5 +27,6 @@ export async function inspectEnvironment({root=path.resolve(import.meta.dirname,
       add('login','GPT 账号登录',/api.?key/i.test(text)?'warning':'ok',/api.?key/i.test(text)?'当前是API密钥登录；本工作台默认使用ChatGPT账号，请运行 codex login 切换。':'本机已登录。生图功能及额度以此账号实际可用能力为准。');
     }catch{add('login','GPT 账号登录','warning','尚未确认登录。Windows双击“登录GPT-Windows.cmd”，使用你自己的账号登录。');}}
   }catch{add('codex','本机 Codex','warning','请先运行 npm install -g @openai/codex，再使用自己的ChatGPT账号登录；采集功能仍可单独使用。');}
+  try{const launch=codexLaunch(imageCodexExecutable());const {stdout}=await exec(launch.command,[...launch.args,'--version'],{env,timeout:15000,windowsHide:true});add('imageCodex','生图Codex · GPT-6.1 Sol','ok','已找到生图入口（'+stdout.trim().slice(0,80)+'）。每次生成前核对模型，不回退其他模型。');}catch{add('imageCodex','生图Codex · GPT-6.1 Sol','error','请更新Codex，或设置 WORKBENCH_IMAGE_CODEX_BIN 指向支持gpt-6.1-sol的入口。');}
   return {platform:process.platform,checks,ok:!checks.some(c=>c.status==='error'),accountIsolation:'仅同步程序。1688登录、本机GPT登录、商品资料、成品和修改偏好分别保存在各自电脑，不上传GitHub。',generationNote:'环境检查不会调用生图，也不验证账号的生图权限；实际不可用时任务会显示原因。'};
 }

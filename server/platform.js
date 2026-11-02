@@ -37,6 +37,14 @@ export function executableLaunch(executable,{platform=process.platform,node=proc
   return {command:executable,args:[]};
 }
 export function codexLaunch(executable,options={}){return executableLaunch(executable||codexExecutable(options),options);}
+export function imageCodexExecutable(options={}){
+  const {env=process.env,platform=process.platform,exists=existsSync}=options;
+  if(env.WORKBENCH_IMAGE_CODEX_BIN)return env.WORKBENCH_IMAGE_CODEX_BIN;
+  if(env.WORKBENCH_CODEX_BIN)return env.WORKBENCH_CODEX_BIN;
+  const bundled='/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex';
+  if(platform==='darwin'&&exists(bundled))return bundled;
+  return codexExecutable(options);
+}
 export async function pythonLaunch({env=runtimeEnv(),platform=process.platform,executable}={}){
   const choices=executable?[{command:executable,args:[]}]:env.WORKBENCH_PYTHON?[{command:env.WORKBENCH_PYTHON,args:[]}]:platform==='win32'?[{command:'py',args:['-3']},{command:'python',args:[]},{command:'python3',args:[]}]:[{command:'/usr/bin/python3',args:[]},{command:'python3',args:[]}];
   for(const choice of choices){const command=findExecutable(choice.command,{env,platform});if(!command)continue;

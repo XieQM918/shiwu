@@ -5,7 +5,7 @@ import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
 import os from 'node:os';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {runtimeEnv,findExecutable,codexExecutable,executableLaunch,pythonLaunch,bundledSkillPath} from '../server/platform.js';
+import {runtimeEnv,findExecutable,codexExecutable,imageCodexExecutable,executableLaunch,pythonLaunch,bundledSkillPath} from '../server/platform.js';
 import {chromeCandidates} from '../server/environment.js';
 import {distributionEntries,privatePath,ROOT} from '../scripts/distribution.mjs';
 const exec=promisify(execFile);
@@ -30,4 +30,12 @@ test('分享清单完整包含Skill和跨平台入口，明确排除本机数据
  assert.ok(names.some(n=>n.startsWith('skills/etsy-accessory-images/assets/style-references/')));assert.ok(names.every(n=>!privatePath(n)));assert.ok(names.every(n=>!n.startsWith('data/')&&!n.startsWith('output/')&&!n.startsWith('node_modules/')));
  for(const n of ['data/workbench.sqlite','output/etsy/result.png','foo/auth.json','.env','.env.local','x/browser-profile/Cookies','node_modules/auth.js'])assert.equal(privatePath(n),true,n);assert.equal(privatePath('.env.example'),false);
  const dir=await mkdtemp(path.join(os.tmpdir(),'shiw-share-'));try{await mkdir(path.join(dir,'server'));await assert.rejects(()=>distributionEntries(dir),/ENOENT/);}finally{await rm(dir,{recursive:true,force:true});}
+});
+
+test('生图入口尊重显式配置、Mac可选新版桌面Codex，Windows不引用Mac路径',()=>{
+ const bundled='/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex';
+ assert.equal(imageCodexExecutable({platform:'darwin',env:{},exists:p=>p===bundled}),bundled);
+ assert.equal(imageCodexExecutable({env:{WORKBENCH_IMAGE_CODEX_BIN:'/custom/images',WORKBENCH_CODEX_BIN:'/custom/codex'}}),'/custom/images');
+ assert.equal(imageCodexExecutable({env:{WORKBENCH_CODEX_BIN:'/custom/codex'}}),'/custom/codex');
+ const win=imageCodexExecutable({platform:'win32',env:{APPDATA:'C:\\Users\\甲\\AppData\\Roaming'},home:'C:\\Users\\甲',exists:p=>p.endsWith('codex.cmd')});assert.ok(win.endsWith('codex.cmd'));assert.ok(!win.includes('/Applications/'));
 });

@@ -15,6 +15,7 @@ import {ReviewService} from './review.js';
 import {ListingService} from './listing.js';
 import {bundledSkillPath} from './platform.js';
 import {inspectEnvironment} from './environment.js';
+import {CODEX_IMAGE_MODEL,IMAGE_REASONING_EFFORT} from './image-model.js';
 
 export const ROOT=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 export function createApp({dataDir=path.join(ROOT,'data'),collectorFactory,store:providedStore,generationFactory,listingFactory,linkResolver,outputRoot=path.join(ROOT,'output/etsy-accessory-images'),listingOutputRoot=path.join(ROOT,'output/etsy-listings')}={}){
@@ -30,6 +31,7 @@ export function createApp({dataDir=path.join(ROOT,'data'),collectorFactory,store
   app.use((req,res,next)=>{
     const hostname=req.hostname;
     if(!['127.0.0.1','localhost','[::1]','::1'].includes(hostname))return res.status(403).json({error:'工作台仅允许本机访问。'});
+    if(req.path.startsWith('/api/chatgpt/companion/bridge/'))return res.status(410).json({error:'网页生图连接已停用；请使用Codex GPT-6.1 Sol。'});
     const origin=req.get('origin');
     if(origin){try{if(new URL(origin).host!==req.get('host'))return res.status(403).json({error:'不接受其他网站发来的操作。'});}catch{return res.sendStatus(403);}}
     if(req.get('sec-fetch-site')==='cross-site')return res.status(403).json({error:'不接受跨站请求。'});
@@ -59,9 +61,10 @@ export function createApp({dataDir=path.join(ROOT,'data'),collectorFactory,store
   app.post('/api/products/:id/variants/:skuId/generate',async(req,res)=>{
     try{const job=await generation.create(req.params.id,req.params.skuId,{autoRepair:req.body.autoRepair===true});res.status(201).json({id:job.id});}catch(e){res.status(409).json({error:e.message});}
   });
-  app.post('/api/chatgpt/browser/open',async(req,res)=>{try{await generation.chatgpt.open();res.json(await generation.chatgpt.status());}catch(e){res.status(409).json({error:e.message});}});
-  app.get('/api/chatgpt/browser/status',async(req,res)=>{try{res.json(await generation.chatgpt.status());}catch(e){res.status(409).json({error:e.message});}});
+  app.use('/api/chatgpt',(req,res)=>res.status(410).json({error:'网页生图方案已停用；新图片任务使用Codex GPT-6.1 Sol。'}));
+  app.get('/api/generation/config',(req,res)=>res.json({provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT}));
   app.patch('/api/generation-jobs/:id/evidence',async(req,res)=>{try{res.json(await generation.setEvidence(req.params.id,req.body.view,req.body.imageIds));}catch(e){res.status(409).json({error:e.message});}});
+  app.post('/api/generation-jobs/:id/source-angles',async(req,res)=>{try{res.json(await generation.sourceAngles(req.params.id));}catch(e){res.status(409).json({error:e.message});}});
   app.get('/api/style-preferences',(req,res)=>res.json({preferences:generation.preferences()}));
   app.patch('/api/style-preferences/:id',(req,res)=>{try{res.json(generation.setPreference(req.params.id,req.body.enabled));}catch(e){res.status(400).json({error:e.message});}});
   app.patch('/api/generation-jobs/:id/options',async(req,res)=>{try{res.json(await generation.setOptions(req.params.id,req.body));}catch(e){res.status(400).json({error:e.message});}});
@@ -79,7 +82,13 @@ export function createApp({dataDir=path.join(ROOT,'data'),collectorFactory,store
     try{const {file,candidate}=await generation.imageFile(req.params.id,req.params.candidateId,{preview:req.query.preview==='1'});res.setHeader('Cache-Control','private, no-cache');if(req.query.download==='1')await sendCleanImage(res,file,path.basename(candidate.file));else res.sendFile(file);}catch(e){res.status(404).json({error:e.message});}
   });
   app.get('/api/generation-jobs/:id/inputs/:imageId',async(req,res)=>{
-    try{const job=generation.get(req.params.id);const ref=job.snapshot.refs.find(r=>r.imageId===req.params.imageId);if(!ref)return res.sendStatus(404);res.sendFile(await containedFile(await generation.directory(job),ref.path));}catch(e){res.status(404).json({error:e.message});}
+    try{const job=generation.get(req.params.id);const ref=[...job.snapshot.refs,...(job.snapshot.angleRefs||[])].find(r=>r.imageId===req.params.imageId);if(!ref)return res.sendStatus(404);res.sendFile(await containedFile(await generation.directory(job),ref.path));}catch(e){res.status(404).json({error:e.message});}
+  });
+  app.get('/api/generation-jobs/:id/angle-sources/:candidateId',async(req,res)=>{
+    try{const job=generation.get(req.params.id),candidate=job.candidates.find(c=>c.id===req.params.candidateId);const source=candidate?.angleSource;
+      if(candidate?.view!=='source'||source?.status!=='ready'||source.file!==`angle-sources/${candidate.letter}.png`)return res.sendStatus(404);
+      res.sendFile(await containedFile(await generation.directory(job),source.file));
+    }catch(e){res.status(404).json({error:e.message});}
   });
   app.get('/api/generation-jobs/:id/download',async(req,res)=>{
     try{await generation.zip(req.params.id,res);}catch(e){if(!res.headersSent)res.status(409).json({error:e.message});else res.destroy(e);}

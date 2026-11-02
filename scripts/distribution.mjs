@@ -2,7 +2,7 @@ import path from 'node:path';
 import {readdir,lstat,readFile} from 'node:fs/promises';
 export const ROOT=path.resolve(import.meta.dirname,'..');
 const files=['package.json','package-lock.json','index.html','vite.config.js','.gitignore','.gitattributes','.env.example','README.md','WINDOWS.md','GITHUB.md','COMPATIBILITY.md','使用说明.md','变更需求记录.md','验证结果.md','启动工作台.command','start-workbench.cmd','启动工作台-Windows.cmd','环境检查-Windows.cmd','登录GPT-Windows.cmd'];
-const directories=['server','src','scripts','native','skills','test','.github'];
+const directories=['server','src','scripts','native','skills','test','browser-extension','.github'];
 export function privatePath(relative){return /(^|\/)(data|output|node_modules|dist|\.git|\.codex|browser-profile|chatgpt-browser-profile)(\/|$)/i.test(relative)||/(^|\/)(auth|cookies|storage-state)\.json$/i.test(relative)||/(^|\/)\.env(?:\..*)?$/.test(relative)&&relative!=='.env.example'||/\.(sqlite(?:-.*)?|db|log|zip|traineddata(?:\.gz)?)$/i.test(relative);}
 export async function distributionEntries(root=ROOT){
   const entries=[];

@@ -62,7 +62,7 @@ function App(){
       <div className="workspace-tag"><div className="workspace-avatar">拾</div><span>我的选品空间<small>本机工作区</small></span><span className="local-dot"/></div>
       <div className="nav-label">工作空间</div>
       <nav><button className={page==='products'?'active':''} onClick={()=>setPage('products')}><Package size={18}/>商品采集<span className="nav-count">{data.products.length}</span></button><button className={page==='history'?'active':''} onClick={()=>setPage('history')}><Clock3 size={18}/>采集记录{data.jobs.length>0&&<span className="nav-count">{data.jobs.length}</span>}</button><button className={page==='review'?'active':''} onClick={()=>setPage('review')}><ListChecks size={18}/>修改审阅中心<span className="nav-count">{data.pendingReviews||0}</span></button></nav>
-      <div className="sidebar-note"><div className="note-icon"><ShieldCheck size={19}/></div><strong>留在本机，安心整理</strong><p>采集资料与成品保存在本机。<br/>生成图片及文案所需资料会发送至 Codex。</p><div><span className="local-dot"/>无需付费采集接口</div></div>
+      <div className="sidebar-note"><div className="note-icon"><ShieldCheck size={19}/></div><strong>留在本机，安心整理</strong><p>采集资料与成品保存在本机。<br/>生图及上架文案所需资料发送至Codex。</p><div><span className="local-dot"/>无需付费采集接口</div></div>
       <div className="sidebar-footer"><Monitor size={15}/><span>本机版工作台</span><span>v1.0</span></div>
     </aside>
     <main className="main">

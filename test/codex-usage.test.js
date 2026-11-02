@@ -28,3 +28,9 @@ test('中断或失败仍返回已产生用量，未返回统计不伪装为零�
   };
   await assert.rejects(()=>client.runTurn({threadId:'t',input:[],collectUsage:true}),e=>e.usage.imageCalls===1&&e.usage.tokensKnown===false);client.close();
 });
+
+test('指定模型时必须核对App Server实际回显，不把默认模型当成Luna',async()=>{
+ const client=new CodexClient();client.request=async()=>({thread:{id:'fixture'},model:'gpt-5.6-sol'});
+ await assert.rejects(()=>client.startThread({model:'gpt-6.1-sol',expectedModel:'gpt-6.1-sol'}),/未确认指定模型/);
+ client.request=async()=>({thread:{id:'fixture'},model:'gpt-6.1-sol'});assert.equal(await client.startThread({model:'gpt-6.1-sol',expectedModel:'gpt-6.1-sol'}),'fixture');assert.equal(client.lastThreadModel,'gpt-6.1-sol');client.close();
+});

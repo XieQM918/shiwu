@@ -7,7 +7,7 @@
 - 安装Node.js 24或更高版本，保留npm组件：[官方安装包](https://nodejs.org/)。
 - 安装Google Chrome：[官方下载](https://www.google.com/chrome/)。
 - 安装Python 3.9或更高版本，选择安装启动器并加入PATH：[官方Windows安装包](https://www.python.org/downloads/windows/)。不需要另外安装Tesseract、Visual Studio、Apple工具或WSL。
-- 在“命令提示符”输入 `npm.cmd install -g @openai/codex`，安装官方Codex CLI。打开项目目录，双击“登录GPT-Windows.cmd”，根据官方登录页面使用**自己的ChatGPT账号**登录。
+- 在“命令提示符”输入 `npm.cmd install -g @openai/codex@latest`，安装官方Codex CLI。打开项目目录，双击“登录GPT-Windows.cmd”，根据官方登录页面使用**自己的ChatGPT账号**登录。
 
 启动器会在首次运行或依赖更新时执行锁定版本的安装，自动取得本机OCR、中英文模型以及Windows版ExifTool。ExifTool属于可选平台依赖，请不要关闭npm的optional dependencies。图片清理仍使用项目原有Python Skill。
 
@@ -17,8 +17,8 @@ Windows原生Codex使用方式参见 [OpenAI Windows文档](https://learn.chatgp
 
 1. 双击“启动工作台-Windows.cmd”，等待浏览器自动打开；已有服务运行时直接打开现有工作台。
 2. 点“登录 / 查看1688”打开采集窗口，用自己的1688账号登录。此窗口和你的日常浏览器资料分开保存。
-3. 在「环境检查」点击「登录 / 查看ChatGPT」，在独立窗口登录自己的会员账号。网页需要实际提供GPT-6 Luna，未提供则暂停，不改用其他模型。此流程是网页操作，不是公开图片API。
-4. 粘贴链接采集，核对参数，再生成图片或查看上架文案。新图片批次不调用Codex；上架文案继续使用前述Codex登录。
+3. 生图使用本机Codex，固定GPT-6.1 Sol、低推理。请使用自己的账号登录Codex；网页登录与连接扩展已停用。若模型目录没有gpt-6.1-sol，请更新Codex，不会回退5.6或其他模型。
+4. 粘贴链接采集，核对参数，再生成图片或查看上架文案。图片和文案均使用你在本机登录的Codex；图片任务固定GPT-6.1 Sol，不需要网页登录或浏览器扩展。
 5. 关闭网页不会停止服务。使用结束可在启动窗口按Ctrl+C；重启后未完成任务由你选择继续，已完成结果保留。
 
 ## 环境检查与常见问题
@@ -40,8 +40,10 @@ Windows原生Codex使用方式参见 [OpenAI Windows文档](https://learn.chatgp
 
 使用GitHub ZIP更新时，建议将新的代码覆盖到原目录；不要删除旧的`data/`和`output/`。首次迁移电脑时需重新登录各账号；不通过GitHub传递数据库、浏览器资料或Codex凭据。
 
-## 会员网页生图与恢复
+## Codex GPT-6.1 Sol生图与恢复
 
-网页资料在data/chatgpt-browser-profile，与1688及Codex登录分开。未登录、验证、额度不足、模型选项缺失或网页变化时队列暂停；处理专用窗口后点击继续。20分钟未完成也会暂停，继续只检查原会话。若提交是否成功不明确，请在窗口打开含任务编号的原会话，不要重复点发送。历史Codex任务不自动续跑，新建生成将使用网页渠道。
+使用本机Codex账号，新任务固定gpt-6.1-sol、低推理。每张为独立短会话，默认一稿。角度位从当前规格锚图及匹配后的共用图中选取实际轻斜拍、俯拍等非正视角，再用高清原图裁切生成 Etsy 摄影图；最多3个，缺口明确显示，不推造侧背结构。选角一次并缓存，用量可在本批记录中查看。停止或重启后保留原图、已生成图片与用量记录；仅继续未完成位置。
 
-网页不提供官方单图token账单，界面只展示已提交/下载数量；未统计不代表零消耗。下载结果显示待核对，不宣称已经人工审图。网页选择器仅通过隔离页面测试；真实登录、可选模型和下载受各自账号及页面实际状态影响。
+网页生图方案已停用，浏览器连接扩展不再需要。历史网页批次保留，通过“重新生成”创建新的Codex批次，不把历史模型记录改成新模型。
+
+可用性以当前账号的模型目录及会话实际回显为准。若旧版Codex缺少gpt-6.1-sol，请运行 `npm.cmd install -g @openai/codex@latest` 更新，或设置WORKBENCH_IMAGE_CODEX_BIN指向可用的本机入口。

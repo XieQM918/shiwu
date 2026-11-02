@@ -10,6 +10,7 @@ import ExcelJS from 'exceljs';
 import {createApp,ROOT} from '../server/index.js';
 import {newProduct,extractFields} from '../server/domain.js';
 import {GenerationService} from '../server/generation.js';
+import {materializeAnglePlan} from '../server/angle-sources.js';
 import {ListingService} from '../server/listing.js';
 import {pythonLaunch,runtimeEnv} from '../server/platform.js';
 const exec=promisify(execFile);const py=await pythonLaunch();const python=args=>exec(py.command,[...py.args,...args],{env:runtimeEnv()});
@@ -17,7 +18,7 @@ const untilUi=async(fn)=>{for(let i=0;i<100;i++){if(fn())return;await new Promis
 const dir=await mkdtemp(path.join(os.tmpdir(),'shiw-ui-'));
 const {app,store,generation,listing}=createApp({dataDir:dir,listingOutputRoot:path.join(dir,'listings'),listingFactory:options=>new ListingService({...options,runnerFactory:()=>({async generate(job){return {title:job.target?'Refined Floral Accessory':'Floral Accessory',description:'A floral accessory for everyday styling.',tags:['floral accessory','everyday accessory','simple accessory'],notesZh:['界面测试替身；包装、物流未确认。'],evidence:[],ruleSuggestion:job.target?'标题简短自然':''};},close(){}})}),outputRoot:path.join(dir,'generated'),collectorFactory:()=>({busy:false,context:null}),generationFactory:options=>new GenerationService({...options,runnerFactory:()=>({
   async open(){return 'ui-fixture-thread';},
-  async generate(job,c,batchDir){const file=`results/${c.filename}.jpg`;await writeFile(path.join(batchDir,file),await readFile(path.join(dir,'images/999001/a.jpg')));return {status:'completed',file,hash:'ui-fixture',width:1,height:1,reason:'界面测试替身',recommendation:'界面测试用图片，不是真实生成结果'};},close(){}
+  async generate(job,c,batchDir,{onEvent}){let angleSource; if(c.view==='source'&&c.letter==='A'){const plan=await materializeAnglePlan(job.snapshot,{slots:['A','B','C'].map(letter=>({letter,imageId:letter==='A'?job.snapshot.refs[0].imageId:null,crop:[0,0,1,1],matchesSku:letter==='A',nonFrontal:letter==='A',viewDescription:'界面替身：原素材轻斜拍',reason:'测试缺口'}))},batchDir,{jobId:job.id,model:'fixture'});angleSource=plan.slots[0];onEvent({anglePlan:plan,angleSource});}const file=`results/${c.filename}.jpg`;await writeFile(path.join(batchDir,file),await readFile(path.join(dir,'images/999001/a.jpg')));return {status:'completed',file,angleSource,hash:'ui-fixture',width:1,height:1,reason:'界面测试替身',recommendation:'界面测试用图片，不是真实生成结果'};},close(){}
 })})});
 app.use(express.static(path.join(ROOT,'dist')));
 const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});
@@ -38,7 +39,11 @@ try{
   await page.locator('#field-value').fill('2.8');await page.getByRole('button',{name:'保存参数'}).click();await page.getByRole('button',{name:'2.8',exact:true}).waitFor();assert.equal(store.product('999001').fields.length.value,2.8);
   await page.getByRole('button',{name:'查看商品999001图片'}).click();await page.getByRole('heading',{name:'商品图片'}).waitFor();await page.locator('.gallery-toolbar').getByRole('button',{name:'下载失败'}).click();await page.getByText('HTTP 404',{exact:true}).waitFor();await page.getByRole('button',{name:'关闭图片库'}).click();
   await page.getByRole('button',{name:'为测试金色生成 Etsy 图片',exact:true}).click();await page.getByRole('dialog',{name:'Etsy 图片生成'}).waitFor();await page.getByText('已完成 4/6 张，2 张缺少依据',{exact:true}).waitFor();
-  assert.equal(await page.locator('.generation-candidate.completed').count(),4);await page.getByText('不同角度 · 正面',{exact:true}).waitFor();await page.getByText('不同角度 · 侧面',{exact:true}).waitFor();await page.getByText('不同角度 · 背面',{exact:true}).waitFor();await page.getByText('本批调用与用量',{exact:true}).click();await page.getByText(/已提交 0 张，已下载 0 张/).waitFor();assert.equal(await page.locator('.generation-candidate.blocked').count(),2);
+  assert.equal(await page.locator('.generation-candidate.completed').count(),4);await page.getByText('不同角度 · 原素材视角 1',{exact:true}).waitFor();await page.getByText('不同角度 · 原素材视角 2',{exact:true}).waitFor();await page.getByText('不同角度 · 原素材视角 3',{exact:true}).waitFor();await page.getByText('本批调用与用量',{exact:true}).click();await page.getByText(/此批尚无用量记录/).waitFor();await page.getByText(/Codex内置生图 · GPT-6.1 Sol/).waitFor();assert.equal(await page.getByRole('button',{name:'浏览器接入设置',exact:true}).count(),0);assert.equal(await page.locator('.generation-candidate.blocked').count(),2);
+  await page.getByText('查看实际视角来源',{exact:true}).click();await page.getByText('界面替身：原素材轻斜拍',{exact:true}).waitFor();
+  const sourceCrop=page.getByAltText('原素材视角 1 原图裁切',{exact:true});await sourceCrop.waitFor();assert.equal((await page.request.get(new URL(await sourceCrop.getAttribute('src'),page.url()).href)).status(),200);
+  const actualJob=store.imageJobs().find(j=>j.kind==='batch');assert.equal((await page.request.get(new URL(`/api/generation-jobs/${actualJob.id}/angle-sources/overview-A`,page.url()).href)).status(),404);
+  await page.getByText('查看实际视角来源',{exact:true}).click();
   await page.getByRole('button',{name:'放大完整外观 A',exact:true}).click();await page.getByRole('button',{name:'关闭成品大图'}).click();
   let genDownload=page.waitForEvent('download');await page.getByRole('button',{name:'下载原批次图片包',exact:true}).click();const genZip=await genDownload;const genZipPath=path.join(dir,'etsy.zip');await genZip.saveAs(genZipPath);
   const genChecked=await python(['-c','import zipfile,json,sys; z=zipfile.ZipFile(sys.argv[1]); print(json.dumps(z.namelist()))',genZipPath]);const genNames=JSON.parse(genChecked.stdout);assert.equal(genNames.filter(n=>n.endsWith('.jpg')).length,4);assert.ok(genNames.includes('成品清单.json'));

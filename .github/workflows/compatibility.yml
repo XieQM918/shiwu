@@ -32,6 +32,7 @@ jobs:
       - run: npm test
       - run: npm run test:ui
       - run: npm run check:share
+      - run: npm run test:launch
   package:
     needs: verify
     runs-on: ubuntu-latest

@@ -50,9 +50,11 @@ export class CodexClient extends EventEmitter {
     this.emit('notification',message);
   }
   fail(error){for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(error);}this.pending.clear();this.emit('disconnect',error);}
-  async startThread({cwd=this.cwd,developerInstructions,model}={}){
+  async startThread({cwd=this.cwd,developerInstructions,model,expectedModel}={}){
     const result=await this.request('thread/start',{cwd,sandbox:'workspace-write',approvalPolicy:'never',developerInstructions,model,
       config:{'features.apps':false,'features.plugins':false,'features.multi_agent':false,'features.browser_use':false,'features.computer_use':false}});
+    this.lastThreadModel=result.model||result.thread?.model||null;
+    if(expectedModel&&this.lastThreadModel!==expectedModel)throw new Error('Codex未确认指定模型 '+expectedModel+'；未启动生图，不回退其他模型。');
     return result.thread.id;
   }
   async runTurn({threadId,input,outputSchema,onEvent=()=>{},signal,effort='low',collectUsage=false,timeoutMs=25*60*1000,timeoutMessage='本张图片生成超时；可重试未完成项。'}){

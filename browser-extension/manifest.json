@@ -1,0 +1,10 @@
+{
+  "manifest_version":3,
+  "name":"拾物 ChatGPT 连接",
+  "version":"1.0.3",
+  "description":"让本机拾物工作台使用本浏览器已登录的ChatGPT，仅操作指定生图标签页。",
+  "permissions":["storage","scripting","alarms","downloads","debugger"],
+  "host_permissions":["https://chatgpt.com/*","http://127.0.0.1/*"],
+  "background":{"service_worker":"worker.js","type":"module"},
+  "action":{"default_popup":"popup.html","default_title":"连接拾物工作台"}
+}

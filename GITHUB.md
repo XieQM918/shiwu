@@ -37,7 +37,7 @@ git clone https://github.com/XieQM918/shiwu.git
 
 ## 自动检查
 
-`.github/workflows/compatibility.yml`在推送、拉取请求或手动触发时，在Mac和Windows运行构建、测试、图片OCR及下载清理和界面检查。全部通过后生成一个工程包，在Actions页面的Artifacts下载。
+`.github/workflows/compatibility.yml`在推送、拉取请求或手动触发时，在Mac和Windows运行构建、测试、图片OCR及下载清理、界面检查，以及工程ZIP解压后的首次安装启动检查（Windows实际执行.cmd入口）。全部通过后生成一个工程包，在Actions页面的Artifacts下载。
 
 CI不保存账号，不登录1688，不消耗GPT生图额度。伙伴的真实GPT生图和1688验证需要在其电脑上各自完成一次。只有Actions实际运行后显示绿色，才表示对应提交通过了Windows运行器检查；工程中提供工作流不代表已经执行了远程验收。
 
