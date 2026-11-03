@@ -91,3 +91,10 @@ test('达到保护上限时仍保存本次实际返回图片，同时要求暂�
   const r=await runner.generate({snapshot:f.snapshot},planCandidates(f.snapshot)[0],f.dir);assert.equal(r.status,'completed');assert.equal(r.pauseReason,'model_step_limit');assert.ok((await readFile(path.join(f.dir,r.file))).length);
  }finally{await f.clean();}
 });
+
+test('选定原素材裁切也不能作为生成结果，原始输入不能冒充成品',async()=>{
+ const f=await fixture();const runner=new CodexImageRunner({traceFactory:fakeTraceFactory,ocr:{dimensions:async file=>sharp(file).metadata()}});runner.threadId='crop';
+ try{const crop=await sharp({create:{width:20,height:10,channels:3,background:'#ffee11'}}).png().toBuffer(),file=path.join(f.dir,'crop.png');await writeFile(file,crop);runner.client={async runTurn(){return {messages:[JSON.stringify({path:file})],items:[{type:'imageGeneration',id:'bad',status:'completed',savedPath:file}]};}};
+  await assert.rejects(()=>runner.generate({snapshot:f.snapshot},{...planCandidates(f.snapshot)[0],angleSource:{hash:hashBuffer(crop)}},f.dir),e=>e.failureCode==='file_invalid');
+ }finally{await f.clean();}
+});

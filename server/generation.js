@@ -145,7 +145,7 @@ export class CodexImageRunner {
     if(!file.startsWith(batchRoot+path.sep)&&!(generatedRoot&&file.startsWith(generatedRoot+path.sep)))throw imageFailure('file_invalid','图片路径不属于本任务或本机生图目录。');
     const info=await stat(file);if(!info.isFile())throw imageFailure('file_invalid','生成图片文件不存在。');
     const buffer=await readFile(file),hash=hashBuffer(buffer);
-    if([...angleRefs(job.snapshot),...job.snapshot.styleRefs].some(r=>r.hash===hash))throw imageFailure('file_invalid','返回文件与输入原图或风格参考相同，不能冒充生成成品。');
+    if([...angleRefs(job.snapshot),...job.snapshot.styleRefs,candidate.angleSource||{}].some(r=>r.hash===hash))throw imageFailure('file_invalid','返回文件与输入原图、选角裁切或风格参考相同，不能冒充生成成品。');
     let matchesNative=latestPreview?.hash===hash;
     for(const item of generation.filter(i=>i.savedPath))try{if(hashBuffer(await readFile(item.savedPath))===hash)matchesNative=true;}catch{}
     if(!matchesNative&&!(mcpGeneration.length&&generatedRoot&&file.startsWith(path.join(generatedRoot,this.threadId)+path.sep)&&info.mtimeMs>=startedAt-2000))throw imageFailure('generation_unverified','该文件无法关联本次实际生成结果。');
@@ -156,7 +156,7 @@ export class CodexImageRunner {
     if(Math.abs(dimensions.width/dimensions.height-1)>.025)warnings.push({code:'non_square',message:'图片不是方图，可下载后确认构图。'});
     if(answer.reviewed!==true)warnings.push({code:'review_unavailable',message:'未完成画面核对，请人工确认。'});
     if(answer.reason&&answer.status!=='completed')warnings.push({code:'visual_issue',message:answer.reason});
-    if(error)warnings.push({code:error.failureCode||'review_unavailable',message:error.message});
+    if(error)warnings.push({code:error.failureCode||'result_metadata',message:error.message});
     const filename=`${candidate.filename}.${ext}`,target=path.join(batchDir,'results',filename);await mkdir(path.dirname(target),{recursive:true});if(file!==target)await copyFile(file,target);
     return {status:'completed',reviewState:'pending_user',reason:answer.reason||'图片已生成，待人工核对。',recommendation:answer.recommendation||'',warnings,attempts:1,
       file:`results/${filename}`,hash,bytes:buffer.length,width:dimensions.width,height:dimensions.height,modelReviewed:answer.reviewed===true,
