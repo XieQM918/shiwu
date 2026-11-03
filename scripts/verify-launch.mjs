@@ -29,7 +29,7 @@ try{
     await new Promise(resolve=>setTimeout(resolve,500));
   }
   assert.ok(ready,'解压后首次启动失败或超时：\n'+log);
-  const config=await fetch(base+'/api/generation/config').then(r=>r.json());assert.equal(config.provider,'codex');assert.equal(config.requestedModel,'gpt-6.1-sol');
+  const config=await fetch(base+'/api/generation/config').then(r=>r.json());assert.equal(config.provider,'codex');assert.equal(config.requestedModel,'gpt-6.1-sol');assert.equal(config.reasoningEffort,'medium');assert.equal(config.executionPolicy.maxAdditionalWaits,1);
   const state=await fetch(base+'/api/state').then(r=>r.json());assert.equal(state.products.length,0);assert.equal(state.generationJobs.length,0);
   const html=await fetch(base).then(r=>r.text());assert.match(html,/assets\/index-/);await access(path.join(directory,'data/dependency-lock.sha256'));
   const environment=await fetch(base+'/api/environment').then(r=>r.json());

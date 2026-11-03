@@ -5,25 +5,32 @@ import os from 'node:os';
 import {spawn} from 'node:child_process';
 import archiver from 'archiver';
 import {cleanDownloadFiles} from './download-cleaner.js';
-import {CODEX_IMAGE_MODEL,IMAGE_REASONING_EFFORT} from './image-model.js';
+import {CODEX_IMAGE_MODEL,IMAGE_REASONING_EFFORT,IMAGE_EXECUTION_POLICY} from './image-model.js';
 import {imageCodexExecutable} from './platform.js';
 import {CodexClient,finalJson} from './codex-client.js';
 import {freezeInput,planCandidates,confirmedField,candidateInput,RESULT_SCHEMA,containedFile,hashBuffer,profileKey} from './generation-input.js';
 import {SOURCE_ANGLE_MODE,ANGLE_SOURCE_SCHEMA,angleRefs,anglePlanKey,selectionPreviewInput,materializeAnglePlan,readAnglePlan,saveAnglePlan} from './angle-sources.js';
 
+import {ImageTraceMonitor,imageFailure} from './image-trace.js';
+import {frozenStyle} from './image-style.js';
+
+const traceUsage=(usage,state={})=>({...usage,model:usage.model||CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,additionalWaits:state.additionalWaits||0,phase:state.phase,failureCode:state.failureCode,imageCalls:Math.max(usage.imageCalls||0,state.imageCalls||0)});
 const ACTIVE=['queued','running'];
+export const IMAGE_TURN_TIMEOUT_MS=5*60*1000;
+const connectionFailure=reason=>/连接|超时|登录|auth|rate.limit|quota|usage.limit|not available|not supported|工具不可用|未收到内置生图|未返回图片|connection failed|error sending request/i.test(reason||'');
 export function usageSummary(job){
   const selection=job.anglePlan?.jobId===job.id&&job.anglePlan.usage?[job.anglePlan.usage]:[];
   const records=[...job.candidates.flatMap(c=>c.usageHistory||[]),...selection].sort((a,b)=>(a.startedAt||'').localeCompare(b.startedAt||''));
   if(!records.length)return null;
   const known=records.filter(r=>r.tokensKnown);
-  return {recordedTurns:records.length,tokenRecordedTurns:known.length,...Object.fromEntries(['inputTokens','cachedInputTokens','outputTokens','reasoningOutputTokens','totalTokens','imageCalls','imageViews','commands','durationMs'].map(k=>[k,records.reduce((n,r)=>n+(Number(r[k])||0),0)])),quotaBefore:records[0].quotaBefore||null,quotaAfter:records.at(-1).quotaAfter||null};
+  return {recordedTurns:records.length,tokenRecordedTurns:known.length,uncachedInputTokens:known.reduce((n,r)=>n+Math.max(0,(r.inputTokens||0)-(r.cachedInputTokens||0)),0),modelStepRecordedTurns:records.filter(r=>Number.isFinite(r.modelSteps)).length,...Object.fromEntries(['inputTokens','cachedInputTokens','outputTokens','reasoningOutputTokens','totalTokens','imageCalls','imageViews','commands','durationMs','modelSteps','additionalWaits'].map(k=>[k,records.reduce((n,r)=>n+(Number(r[k])||0),0)])),quotaBefore:records[0].quotaBefore||null,quotaAfter:records.at(-1).quotaAfter||null};
 }
 export function imageJobSummary(job){
   const completed=job.candidates.filter(c=>c.status==='completed').length;
   return {id:job.id,productId:job.productId,skuId:job.skuId,skuLabel:job.snapshot.skuLabel,status:job.status,message:job.message,
     createdAt:job.createdAt,updatedAt:job.updatedAt,completed,total:job.candidates.length,
     blocked:job.candidates.filter(c=>c.status==='blocked').length,failed:job.candidates.filter(c=>c.status==='failed').length,
+    skipped:job.candidates.filter(c=>c.status==='skipped').length,
     previews:job.candidates.filter(c=>c.preview&&c.status!=='completed').length,
     kind:job.kind||'batch',parentJobId:job.parentJobId,parentCandidateId:job.parentCandidateId,
     provider:job.provider||'codex',requestedModel:job.requestedModel||null,waitReason:job.waitReason||null,usage:job.usage||null,planVersion:job.planVersion||1,
@@ -37,7 +44,7 @@ export function imageType(buffer){
 }
 
 export class CodexImageRunner {
-  constructor({ocr,clientFactory=options=>new CodexClient(options)}={}){this.ocr=ocr;this.clientFactory=clientFactory;}
+  constructor({ocr,clientFactory=options=>new CodexClient(options),traceFactory=options=>new ImageTraceMonitor(options)}={}){Object.assign(this,{ocr,clientFactory,traceFactory});}
   async open(job,batchDir,onEvent){
     this.usedThread=false;
     if(process.platform==='darwin'){
@@ -51,7 +58,7 @@ export class CodexImageRunner {
     const selected=models.data?.find(m=>(m.model||m.id)===requested);
     if(!selected)throw new Error('当前Codex入口未提供 GPT-6.1 Sol。请升级Codex或设置 WORKBENCH_IMAGE_CODEX_BIN；不回退5.6或其他模型。');
     this.model=selected.model||selected.id;
-    const instructions='你只负责当前一张商品摄影，使用独立短会话，不需要前面成品的历史。原图已在输入展示，不重复打开；Skill/指南至多各读取一次，风格参考最多一张。快速出图并做一次简短核对，默认不自动重画，不写长篇分析。内置生图返回图片已在视觉上下文中时不再重复view_image。只在当前任务目录保存，不改代码、设置、不读凭据、不发消息、不创建子代理；缺少指定视角依据时直接返回blocked，不耗费生图。';
+    const instructions='你只负责当前一张商品摄影。摄影规范、原图和参考图已提供，不搜索目录、Skill、指南或记忆库，不重复view_image。只调用一次内置生图；exec首行必须设置yield_time_ms:120000；只允许一次wait补查且也必须120000；仍无结果立即failed。已展示结果简短核对一次，不追加审图或重画。不text输出完整工具结果或base64；返回实际图片路径，由工作台保存。缺尺寸不阻止出图，尺度仅供参考，不推算数值或隐藏结构。不读凭据、改设置、发消息或创建代理。';
     this.instructions=instructions;
     // A fresh runtime thread on recovery avoids accidentally continuing an interrupted tool call.
     this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:instructions,model:this.model,expectedModel:this.model});
@@ -91,80 +98,79 @@ export class CodexImageRunner {
     if(candidate.view==='source'){
       const plan=await this.prepareSourceAngles(job,batchDir,{signal,onEvent});
       const source=candidate.angleSource||plan.slots.find(s=>s.letter===candidate.letter);
-      if(!source||source.status!=='ready')return {status:'blocked',reason:source?.reason||'原素材没有更多可用的非正视角，未调用生图。',attempts:0};
+      if(!source||source.status!=='ready')return {status:'skipped',reasonCode:'source_missing',reason:source?.reason||'缺少当前规格的实际视角原图，此位置留空。',attempts:0};
       candidate={...candidate,angleSource:source};onEvent({angleSource:source});
     }
-    if(['side','back'].includes(candidate.view)&&!job.viewEvidence?.[candidate.view]?.length)return {status:'blocked',reason:'当前规格缺少已确认的'+candidate.viewLabel+'原图，未调用生图。',attempts:0};
-    for(const ref of [...job.snapshot.refs,...job.snapshot.styleRefs]){
-      if(ref.hash&&hashBuffer(await readFile(await containedFile(batchDir,ref.path)))!==ref.hash)throw new Error('冻结的参考图片发生变化，请重新建立批次。');
-    }
-    if(hashBuffer(await readFile(path.join(batchDir,job.snapshot.skill.path)))!==job.snapshot.skill.sha256)throw new Error('冻结的 Skill 版本发生变化，请重新建立批次。');
-    // Never replay the previous generated images into the next photograph.
+    if(['side','back'].includes(candidate.view)&&!job.viewEvidence?.[candidate.view]?.length)return {status:'skipped',reasonCode:'source_missing',reason:'当前规格缺少'+candidate.viewLabel+'原图，此位置留空。',attempts:0};
+    for(const ref of [...job.snapshot.refs,...job.snapshot.styleRefs])if(ref.hash&&hashBuffer(await readFile(await containedFile(batchDir,ref.path)))!==ref.hash)throw new Error('冻结的参考图片发生变化，请重新建立批次。');
+    job={...job,styleProfile:await frozenStyle(job.snapshot,batchDir)};
     if(this.usedThread){this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:this.instructions,model:this.model,expectedModel:this.model});onEvent({threadId:this.threadId});}
     this.usedThread=true;
-    const attempts=new Set(),previewTasks=[];const maxAttempts=job.options?.autoRepair?3:1;
-    const result=await this.client.runTurn({threadId:this.threadId,input:candidateInput(job,candidate,batchDir),outputSchema:RESULT_SCHEMA,signal,effort:IMAGE_REASONING_EFFORT,collectUsage:true,onEvent:event=>{
-      const item=event.params?.item;
-      if(item?.type==='imageGeneration'){
-        attempts.add(item.id);
-        if(attempts.size>maxAttempts){this.client.request('turn/interrupt',{threadId:this.threadId,turnId:event.params.turnId},5000).catch(()=>{});return;}
-        onEvent({attempts:attempts.size,message:event.method==='item/started'?`正在调用内置生图${attempts.size>1?` · 第${attempts.size-1}次修正`:''}`:'图片已返回，正在检查'});
-        if(event.method==='item/completed'&&item.status==='completed'&&item.savedPath){
-          const task=this.publishPreview(item.savedPath,job,candidate,batchDir).then(preview=>{if(!signal?.aborted)onEvent({preview,message:'图片已返回，可预览 · 正在核对'});}).catch(()=>{});previewTasks.push(task);
+    const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)controller.abort();
+    let trace,latestPreview,result,error,answer={};const nativeItems=new Map(),attempts=new Set(),previewTasks=[];const startedAt=Date.now();
+    try{
+      trace=this.traceFactory({onViolation:()=>controller.abort(),onChange:value=>onEvent({trace:value})});
+      await trace.start(await this.client.threadPath?.(this.threadId),this.threadId);
+      result=await this.client.runTurn({threadId:this.threadId,input:candidateInput(job,candidate,batchDir),outputSchema:RESULT_SCHEMA,signal:controller.signal,effort:IMAGE_REASONING_EFFORT,collectUsage:true,maxModelSteps:IMAGE_EXECUTION_POLICY.maxModelSteps,timeoutMs:IMAGE_TURN_TIMEOUT_MS,timeoutMessage:'本张任务准备及保存超过5分钟，已停止；生图等待上限为4分钟。',onEvent:event=>{
+        const item=event.params?.item;
+        if(item?.type==='imageGeneration'){
+          attempts.add(item.id);nativeItems.set(item.id,item);
+          if(attempts.size>1){error=imageFailure('image_call_limit','本张只允许生成一次，已停止额外生图。');controller.abort();return;}
+          onEvent({attempts:attempts.size,message:event.method==='item/started'?'正在调用内置生图 · 本张仅一次':'图片已返回，正在保存'});
+          if(event.method==='item/completed'&&item.status==='completed'&&item.savedPath){
+            trace.returnedImage();previewTasks.push(this.publishPreview(item.savedPath,job,candidate,batchDir).then(preview=>{latestPreview=preview;if(!signal?.aborted)onEvent({preview,message:'图片已返回，可预览 · 待人工核对'});}).catch(()=>{}));
+          }
         }
-      }
-      else if(item?.type==='imageView')onEvent({message:'正在对照原图检查'});
-    }});
-    await Promise.all(previewTasks);
-    if(result.usage)onEvent({usage:result.usage});
-    const answer=finalJson(result);
+      }});
+      await trace.flush();if(trace.error)throw trace.error;
+      if(result.usage)onEvent({usage:traceUsage(result.usage,trace.state)});
+      try{answer=finalJson(result);}catch(e){error=e;error.recoverableMetadata=true;}
+    }catch(e){error=trace?.error||error||e;const usage=e.usage||result?.usage;if(usage)error.usage=traceUsage(usage,trace?.state);}
+    finally{await trace?.stop();signal?.removeEventListener('abort',abort);await Promise.all(previewTasks);}
+    const traceState=trace?.state||{};
+    if(error?.usage){onEvent({usage:error.usage});delete error.usage;}
+    if(signal?.aborted)throw new Error('任务已停止');
+    const items=[...(result?.items||[]),...nativeItems.values()];
+    const generation=[...new Map(items.filter(i=>i.type==='imageGeneration'&&i.status==='completed').map(i=>[i.id,i])).values()];
+    const mcpGeneration=items.filter(i=>i.type==='mcpToolCall'&&/imagegen|image_gen/.test(`${i.server} ${i.tool}`)&&i.status==='completed');
+    const pathValue=latestPreview?.file?path.join(batchDir,latestPreview.file):generation.find(i=>i.savedPath)?.savedPath||answer.path;
     const productBrief=typeof answer.productBrief==='string'?answer.productBrief.slice(0,600):'';
-    if(!['completed','blocked','failed'].includes(answer.status))throw new Error('Codex 返回的任务状态无效');
-    if(answer.status!=='completed')return {status:answer.status,reason:answer.reason||'缺少生成依据',attempts:answer.attempts||0,productBrief};
-    if(answer.reviewed!==true)throw new Error('输出尚未经过逐张检查，未列为合格成品');
-    if(!answer.path) return {status:'failed',reason:answer.reason||'本张未形成合格图片文件',attempts:answer.attempts||0};
-    const generation=result.items.filter(i=>i.type==='imageGeneration'&&i.status!=='failed');
-    // Native image generation must have really happened, not just a copied source file.
-    const mcpGeneration=result.items.filter(i=>i.type==='mcpToolCall'&&/imagegen|image_gen/.test(`${i.server} ${i.tool}`)&&i.status==='completed');
-    if(!generation.length&&!mcpGeneration.length)throw new Error('未收到内置生图调用记录，不能将现有图片或文字列为生成成功');
-    const resultsRoot=path.join(batchDir,'results');
-    const output=await containedFile(resultsRoot,path.relative(resultsRoot,String(answer.path||'')));
-    const info=await stat(output);if(!info.isFile()||info.size<1024)throw new Error('生成图片文件缺失或不完整');
-    const buffer=await readFile(output);const hash=hashBuffer(buffer);
-    if([...angleRefs(job.snapshot),...job.snapshot.styleRefs,candidate.angleSource||{}].some(r=>r.hash===hash))throw new Error('输出与输入参考图相同，未视为生成成品');
-    let viewed=false;
-    const generatedRoot=path.resolve(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'generated_images');
-    // The native tool supplies its returned image in the model's visual context.
-    // A matching saved native result plus reviewed:true is sufficient; reopening
-    // the identical file with view_image would repeat the same visual inspection.
-    for(const item of generation.filter(i=>i.status==='completed'&&i.savedPath)){
-      const nativePath=path.resolve(item.savedPath);
-      if(!nativePath.startsWith(generatedRoot+path.sep)&&!nativePath.startsWith(path.resolve(batchDir)+path.sep))continue;
-      try{if(hashBuffer(await readFile(nativePath))===hash){viewed=true;break;}}catch{}
+    if(!pathValue){
+      const e=error||imageFailure(connectionFailure(answer.reason)?'image_connection':'image_failed',answer.reason||'生图未返回图片或可保存路径；没有自动重发。');
+      e.failureCode||='image_failed';e.waitReason||=e.failureCode;e.trace=traceState;throw e;
     }
-    for(const item of result.items.filter(i=>i.type==='imageView')){
-      const viewedPath=path.resolve(item.path);
-      if(!viewedPath.startsWith(path.resolve(batchDir)+path.sep)&&!viewedPath.startsWith(generatedRoot+path.sep))continue;
-      try{if(hashBuffer(await readFile(viewedPath))===hash){viewed=true;break;}}catch{}
-    }
-    if(!viewed)throw new Error('没有实际查看该成品文件的记录，未列为合格成品');
-    const ext=imageType(buffer);const filename=`${candidate.filename}.${ext}`;const target=path.join(resultsRoot,filename);
-    if(output!==target)await rename(output,target);
-    const dimensions=await this.ocr.dimensions(target);
-    if(!dimensions.width||!dimensions.height||Math.min(dimensions.width,dimensions.height)<512)throw new Error('生成图片像素过小或无法读取');
-    if(Math.abs(dimensions.width/dimensions.height-1)>.025)throw new Error('生成图片不是约定的方形，未列为合格成品');
-    return {status:'completed',reason:answer.reason||'已查看并核对',recommendation:answer.recommendation||'',attempts:answer.attempts||1,
-      file:`results/${filename}`,hash,bytes:info.size,width:dimensions.width,height:dimensions.height,reviewedAt:new Date().toISOString(),
-      generationEvidence:generation.map(i=>({id:i.id,status:i.status})),turnId:result.turnId,productBrief,...(candidate.angleSource?{angleSource:candidate.angleSource}:{})};
+    if(!generation.length&&!mcpGeneration.length){const e=imageFailure('generation_unverified','未收到实际生图调用记录，不能把现有文件列为成品。');e.trace=traceState;throw e;}
+    const file=await realpath(path.resolve(batchDir,String(pathValue)));
+    const batchRoot=await realpath(batchDir),generatedRoot=await realpath(path.resolve(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'generated_images')).catch(()=>null);
+    if(!file.startsWith(batchRoot+path.sep)&&!(generatedRoot&&file.startsWith(generatedRoot+path.sep)))throw imageFailure('file_invalid','图片路径不属于本任务或本机生图目录。');
+    const info=await stat(file);if(!info.isFile())throw imageFailure('file_invalid','生成图片文件不存在。');
+    const buffer=await readFile(file),hash=hashBuffer(buffer);
+    if([...angleRefs(job.snapshot),...job.snapshot.styleRefs].some(r=>r.hash===hash))throw imageFailure('file_invalid','返回文件与输入原图或风格参考相同，不能冒充生成成品。');
+    let matchesNative=latestPreview?.hash===hash;
+    for(const item of generation.filter(i=>i.savedPath))try{if(hashBuffer(await readFile(item.savedPath))===hash)matchesNative=true;}catch{}
+    if(!matchesNative&&!(mcpGeneration.length&&generatedRoot&&file.startsWith(path.join(generatedRoot,this.threadId)+path.sep)&&info.mtimeMs>=startedAt-2000))throw imageFailure('generation_unverified','该文件无法关联本次实际生成结果。');
+    let ext,dimensions;try{ext=imageType(buffer);dimensions=await this.ocr.dimensions(file);}catch{throw imageFailure('file_invalid','返回的图片无法正常读取。');}
+    if(!dimensions.width||!dimensions.height)throw imageFailure('file_invalid','返回的图片无法读取尺寸。');
+    const warnings=[...(candidate.warnings||[]).filter(w=>w.code==='scale_unverified')];
+    if(Math.min(dimensions.width,dimensions.height)<512)warnings.push({code:'low_resolution',message:'图片分辨率偏低，请确认后使用。'});
+    if(Math.abs(dimensions.width/dimensions.height-1)>.025)warnings.push({code:'non_square',message:'图片不是方图，可下载后确认构图。'});
+    if(answer.reviewed!==true)warnings.push({code:'review_unavailable',message:'未完成画面核对，请人工确认。'});
+    if(answer.reason&&answer.status!=='completed')warnings.push({code:'visual_issue',message:answer.reason});
+    if(error)warnings.push({code:error.failureCode||'review_unavailable',message:error.message});
+    const filename=`${candidate.filename}.${ext}`,target=path.join(batchDir,'results',filename);await mkdir(path.dirname(target),{recursive:true});if(file!==target)await copyFile(file,target);
+    return {status:'completed',reviewState:'pending_user',reason:answer.reason||'图片已生成，待人工核对。',recommendation:answer.recommendation||'',warnings,attempts:1,
+      file:`results/${filename}`,hash,bytes:buffer.length,width:dimensions.width,height:dimensions.height,modelReviewed:answer.reviewed===true,
+      generationEvidence:generation.map(i=>({id:i.id,status:i.status})),turnId:result?.turnId,productBrief,trace:traceState,
+      ...(error&&!error.recoverableMetadata?{pauseReason:error.failureCode||'image_failed',failureCode:error.failureCode||'image_failed'}:{}),...(candidate.angleSource?{angleSource:candidate.angleSource}:{})};
   }
   async publishPreview(source,job,candidate,batchDir){
     const file=await realpath(source);const generatedRoot=await realpath(path.resolve(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'generated_images')).catch(()=>null);
     if(!(generatedRoot&&file.startsWith(generatedRoot+path.sep))&&!file.startsWith(await realpath(batchDir)+path.sep))throw new Error('预览文件超出允许范围');
-    const buffer=await readFile(file);if(buffer.length<1024)throw new Error('图片尚未保存完整');
+    const buffer=await readFile(file);if(!buffer.length)throw new Error('图片尚未保存完整');
     const hash=hashBuffer(buffer);if([...angleRefs(job.snapshot),candidate.angleSource||{}].some(r=>r.hash===hash))throw new Error('不能把原图作为预览');
     const ext=imageType(buffer);const relative=`drafts/${candidate.filename}-${hash.slice(0,12)}.${ext}`;
     await mkdir(path.join(batchDir,'drafts'),{recursive:true});const target=path.join(batchDir,relative);await copyFile(file,target);
-    const size=await this.ocr.dimensions(target);if(Math.min(size.width||0,size.height||0)<512)throw new Error('预览像素异常');
+    const size=await this.ocr.dimensions(target);if(!size.width||!size.height)throw new Error('预览文件无法读取');
     return {file:relative,hash,width:size.width,height:size.height,bytes:buffer.length,createdAt:new Date().toISOString(),review:'pending'};
   }
   close(){this.client?.close();this.keepAwake?.kill();}
@@ -196,7 +202,7 @@ export class GenerationService {
     const batchDir=path.join(this.outputRoot,directory);
     const snapshot=await freezeInput({product,variant,dataDir:this.dataDir,batchDir,skillPath:this.skillPath});
     await mkdir(path.join(batchDir,'results'),{recursive:true});
-    const job={provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,angleMode:SOURCE_ANGLE_MODE,viewEvidence:{},id,productId,skuId,createdAt,directory,snapshot,candidates:planCandidates(snapshot),planVersion:3,status:'queued',message:'已加入Codex GPT-6.1 Sol队列：最多6张，原素材选角，每张一稿',threadIds:[],kind:'batch',options:{autoRepair:options?.autoRepair===true}};
+    const job={provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,executionPolicy:{...IMAGE_EXECUTION_POLICY,reasoningEffort:IMAGE_REASONING_EFFORT},angleMode:SOURCE_ANGLE_MODE,viewEvidence:{},id,productId,skuId,createdAt,directory,snapshot,candidates:planCandidates(snapshot),planVersion:4,status:'queued',message:'已加入GPT-6.1 Sol中等推理队列：每张一稿，最多补查一次',threadIds:[],kind:'batch',options:{autoRepair:false}};
     this.freezeRules(job);
     this.store.saveImageJob(job);this.kick();return job;
   }
@@ -209,6 +215,7 @@ export class GenerationService {
   }
   async setOptions(id,{autoRepair}){
     if(typeof autoRepair!=='boolean')throw new Error('自动修正选项必须为开或关');
+    if(autoRepair)throw new Error('自动重画已关闭；如需调整，请使用单张修改或重新生成。');
     const job=this.active?.id===id?this.active.job:this.get(id);job.options={autoRepair};await this.persist(job);return job;
   }
   async adjust(id,candidateId,instruction){
@@ -236,8 +243,8 @@ export class GenerationService {
     const snapshot=structuredClone(parent.snapshot);snapshot.fields={...snapshot.fields,...parent.confirmedUpdates};snapshot.frozenAt=createdAt;
     const job={provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,viewEvidence:structuredClone(parent.viewEvidence||{}),id:idNew,productId:parent.productId,skuId:parent.skuId,createdAt,directory,snapshot,kind:'adjustment',parentJobId:id,parentCandidateId:candidateId,
       adjustment:{instruction,sourceFile,sourceHash:hashBuffer(buffer),sourceImageHash:usePreview?original.preview.hash:original.hash},
-      planVersion:parent.planVersion||1,angleMode:parent.angleMode,options:{autoRepair:false},status:'queued',message:'风格要求已记录，当前图片结束后优先调整',threadIds:[],
-      candidates:[{id:original.id,scene:original.scene,label:original.label,letter:original.letter,view:original.view,viewLabel:original.viewLabel,viewBrief:original.viewBrief,angleSource:original.angleSource,filename:original.filename,status:'pending',reason:'',attempts:0}]};
+      planVersion:parent.planVersion||1,executionPolicy:{...IMAGE_EXECUTION_POLICY,reasoningEffort:IMAGE_REASONING_EFFORT},angleMode:parent.angleMode,options:{autoRepair:false},status:'queued',message:'风格要求已记录，当前图片结束后优先调整',threadIds:[],
+      candidates:[{id:original.id,scene:original.scene,label:original.label,letter:original.letter,view:original.view,viewLabel:original.viewLabel,viewBrief:original.viewBrief,angleSource:original.angleSource,warnings:original.warnings?.filter(w=>w.code==='scale_unverified')||[],filename:original.filename,status:'pending',reason:'',attempts:0}]};
     this.freezeRules(job);
     if(this.review)job.feedbackId=this.review.imageCreated(job,parent,original).id;
     let root=parent;while(root.parentJobId)root=this.get(root.parentJobId);
@@ -277,6 +284,8 @@ export class GenerationService {
       delete job.anglePlan;
     }
     delete job.waitReason;
+    job.executionPolicy={...IMAGE_EXECUTION_POLICY,reasoningEffort:IMAGE_REASONING_EFFORT};
+    job.policyHistory||=[];job.policyHistory.push({at:new Date().toISOString(),...job.executionPolicy});
     const current=this.store.product(job.productId)?.variants.find(v=>v.id===job.skuId);
     const updates={};
     for(const [key,field] of Object.entries(current?.fields||{}))if(field.status==='manual'&&confirmedField(field))updates[key]=structuredClone(field);
@@ -289,6 +298,7 @@ export class GenerationService {
     for(const c of job.candidates){
       if(c.status==='completed')continue;
       const fresh=replanned.find(p=>p.id===c.id);
+      if(fresh)c.warnings=fresh.warnings;
       if(['side','back'].includes(c.view)&&job.viewEvidence?.[c.view]?.length&&c.status==='blocked'){c.status='pending';c.reason='';}
       if(c.status==='blocked'&&fresh?.status!=='blocked'&&(retry||c.scene==='use'||c.scene==='scale')){c.status='pending';c.reason='';}
       if(retry&&c.status==='failed'){c.status='pending';c.reason='';}
@@ -345,24 +355,35 @@ export class GenerationService {
         c.status='running';job.message=`${c.label} ${c.letter} · 正在生成`;await this.persist(job);
         const effective={...job,snapshot:{...job.snapshot,fields:{...job.snapshot.fields,...job.confirmedUpdates}}};
         try{
-          const result=await runner.generate(effective,c,dir,{signal:active.controller.signal,onEvent:({message,attempts,preview,threadId,usage,model,anglePlan,angleSource})=>{
+          c.execution={...job.executionPolicy,model:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,startedAt:new Date().toISOString()};
+          const result=await runner.generate(effective,c,dir,{signal:active.controller.signal,onEvent:({message,attempts,preview,threadId,usage,model,anglePlan,angleSource,trace})=>{
             if(model)job.model=model;
             if(angleSource)c.angleSource=angleSource;
+            if(trace){c.trace=trace;this.store.saveImageJob(job);}
             if(anglePlan){job.anglePlan=anglePlan;job.usage=usageSummary(job);this.store.saveImageJob(job);}
             if(threadId){job.threadIds.push(threadId);job.threadId=threadId;}
             if(usage){c.usageHistory||=[];c.usageHistory.push(usage);job.usage=usageSummary(job);this.store.saveImageJob(job);}
             if(!active.stop&&!this.closing&&message){if(attempts)c.attempts=attempts;if(preview)c.preview=preview;job.message=`${c.label} ${c.letter} · ${message}`;this.store.saveImageJob(job);}
           }});
           if(active.stop||this.closing){c.status='pending';break;}
-          Object.assign(c,result);
+          Object.assign(c,result);c.execution.finishedAt=new Date().toISOString();c.execution.durationMs=Date.now()-Date.parse(c.execution.startedAt);
+          if(result.pauseReason){const e=imageFailure(result.pauseReason,'图片已保存，但执行触及保护上限；本批已暂停，请核对后再决定是否继续。');throw e;}
+          // Models may report transport failures as blocked JSON instead of throwing.
+          // Pause here too, before a second image request consumes the same broken connection.
+          if(result.status!=='completed'&&connectionFailure(result.reason)){
+            c.status='failed';const error=new Error(result.reason);error.waitReason='image_connection';throw error;
+          }
           if(result.productBrief){job.profile={brief:result.productBrief,productId:job.productId,skuId:job.skuId,createdAt:new Date().toISOString()};this.store.saveImageProfile(factsKey,job.profile);}
         }catch(e){
+          if(c.execution){c.execution.finishedAt=new Date().toISOString();c.execution.durationMs=Date.now()-Date.parse(c.execution.startedAt);c.execution.failureCode=e.failureCode||e.waitReason||'image_failed';}
           if(e.usage){c.usageHistory||=[];c.usageHistory.push(e.usage);job.usage=usageSummary(job);}
           if(active.stop||this.closing){c.status='pending';break;}
-          if(e.waitReason){c.status='pending';c.reason=e.message;throw e;}
+          if(e.failureCode){c.failureCode=e.failureCode;if(e.trace)c.trace=e.trace;if(c.status==='running')c.status='failed';}
+          if(e.waitReason){if(c.status==='running')c.status='pending';if(c.status!=='completed')c.reason=e.message;throw e;}
           c.status='failed';c.reason=e.message;
           // A broken transport/auth connection cannot be repaired by generating the next eleven images.
-          if(/连接|超时|登录|冻结|auth|rate.limit|quota|usage.limit|not available|not supported|工具不可用|未收到内置生图/i.test(e.message))throw e;
+          if(connectionFailure(e.message)||/等待超过|超过5分钟/.test(e.message)){e.waitReason='image_connection';throw e;}
+          if(/冻结/.test(e.message))throw e;
         }
         await this.persist(job);
         if(job.kind!=='adjustment'&&this.store.imageJobs().some(j=>j.status==='queued'&&j.kind==='adjustment')){yielded=true;break;}
@@ -370,7 +391,7 @@ export class GenerationService {
       if(this.closing){job.status='paused';job.message='服务停止，已完成图片保留，点击继续。';}
       else if(active.stop){delete job.waitReason;job.status='stopped';job.message='已停止，已完成图片保留。';}
       else if(yielded){job.status='queued';job.message='先处理风格调整，随后继续此批次';}
-      else {const summary=imageJobSummary(job);job.status=summary.completed===summary.total?'done':summary.completed?'partial':summary.failed?'failed':'blocked';job.message=`已完成 ${summary.completed}/${summary.total} 张${summary.blocked?`，${summary.blocked} 张缺少依据`:''}${summary.failed?`，${summary.failed} 张失败`:''}`;}
+      else {const summary=imageJobSummary(job);job.status=summary.completed+summary.skipped===summary.total?'done':summary.completed?'partial':summary.failed?'failed':'blocked';job.message=`已生成 ${summary.completed}/${summary.total} 张${summary.skipped?`，${summary.skipped} 个位置缺素材留空`:''}${summary.blocked?`，${summary.blocked} 张缺少依据`:''}${summary.failed?`，${summary.failed} 张失败`:''}`;}
     }catch(e){
       job.waitReason=e.waitReason||null;job.status=this.closing||e.waitReason?'paused':active.stop?'stopped':job.candidates.some(c=>c.status==='completed')?'partial':'failed';job.message=e.message;
       for(const c of job.candidates)if(c.status==='running')c.status='pending';

@@ -2,6 +2,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {CodexClient,quotaWindows} from '../server/codex-client.js';
 
+test('生图超时实际中断后台turn并保留用量记录',async()=>{
+  const client=new CodexClient();const interrupted=[];
+  client.request=async(method,params)=>{
+    if(method==='account/rateLimits/read')return null;
+    if(method==='turn/start'){queueMicrotask(()=>client.emit('notification',{method:'item/started',params:{threadId:'timeout-thread',item:{id:'g',type:'imageGeneration'}}}));return {turn:{id:'timeout-turn'}};}
+    if(method==='turn/interrupt'){interrupted.push(params);return {};}
+  };
+  try{
+    await assert.rejects(()=>client.runTurn({threadId:'timeout-thread',input:[],timeoutMs:20,timeoutMessage:'图片超时',collectUsage:true}),e=>e.message==='图片超时'&&e.usage.imageCalls===1);
+    assert.ok(interrupted.some(p=>p.threadId==='timeout-thread'&&p.turnId==='timeout-turn'));assert.equal(client.listenerCount('notification'),0);
+  }finally{client.close();}
+});
+
 test('用量仅保存计数与窗口，不存身份凭据；去重工具事件，缓存不重复相加',async()=>{
   const client=new CodexClient();let sequence=0;
   client.request=async method=>{

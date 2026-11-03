@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {fakeTraceFactory} from './helpers/image-trace.js';
 import assert from 'node:assert/strict';
 import {mkdtemp,mkdir,writeFile,readFile,rm,symlink} from 'node:fs/promises';
 import path from 'node:path';
@@ -7,7 +8,7 @@ import {Store} from '../server/db.js';
 import {ReviewService} from '../server/review.js';
 import {WebWait} from '../server/chatgpt-web.js';
 import {newProduct,extractFields} from '../server/domain.js';
-import {GenerationService,CodexImageRunner,imageJobSummary,imageType} from '../server/generation.js';
+import {GenerationService,CodexImageRunner,imageJobSummary,imageType,IMAGE_TURN_TIMEOUT_MS} from '../server/generation.js';
 import {freezeInput,planCandidates,containedFile,candidateInput} from '../server/generation-input.js';
 
 const PNG=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jO/kAAAAASUVORK5CYII=','base64');
@@ -23,13 +24,49 @@ async function setup(){
 }
 const waitFor=async(predicate)=>{for(let i=0;i<250;i++){if(predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('等待状态超时');};
 
+test('图片已返回但达到执行上限，保留下载并暂停后续商品；不能开启自动重画',async()=>{
+ const f=await setup();let calls=0;const service=new GenerationService({...f,runnerFactory:()=>({async open(){return 'fake';},async generate(job,c,dir){calls++;const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file,pauseReason:'model_step_limit'};},close(){}})});
+ try{const a=await service.create('123','purple');const b=await service.create('123','blue');await waitFor(()=>!service.active&&service.get(a.id).status==='paused');assert.equal(calls,1);assert.equal(service.get(b.id).status,'queued');assert.equal(service.get(a.id).candidates[0].status,'completed');assert.ok((await readFile((await service.imageFile(a.id,'use-A')).file)).length);await assert.rejects(()=>service.setOptions(a.id,{autoRepair:true}),/自动重画已关闭/);
+ }finally{await service.close();await f.clean();}
+});
+
+test('JSON返回连接失败也暂停队列，不误报缺少依据或继续下一张；重试保留成品',async()=>{
+  const f=await setup();const calls=[];let broken=true;
+  for(const key of ['length','width'])f.p.variants[0].fields[key]={status:'manual',value:3,sources:[]};f.store.saveProduct(f.p);
+  const service=new GenerationService({...f,runnerFactory:()=>({async open(){return 'fixture';},async generate(job,c,dir){
+    calls.push(job.id+'/'+c.id);
+    if(c.id==='overview-A'&&broken)return {status:'blocked',reason:'内置生图连接失败，未返回图片，无法核对或保存。',attempts:1};
+    const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file};
+  },close(){}})});
+  try{
+    const a=await service.create('123','purple');const b=await service.create('123','blue');
+    await waitFor(()=>!service.active&&service.get(a.id).waitReason==='image_connection');
+    const paused=service.get(a.id);assert.equal(paused.status,'paused');assert.equal(paused.candidates[0].status,'completed');assert.equal(paused.candidates[1].status,'failed');assert.equal(paused.candidates[2].status,'pending');
+    assert.equal(service.get(b.id).status,'queued');assert.equal(calls.length,2);
+    await service.stop(b.id);broken=false;await service.resume(a.id,{retry:true});await waitFor(()=>!service.active&&service.get(a.id).status==='done');
+    assert.equal(calls.filter(c=>c===a.id+'/use-A').length,1);assert.equal(service.get(a.id).candidates[1].status,'completed');
+  }finally{await service.close();await f.clean();}
+});
+
+test('生图总任务上限包含准备保存，连接与无图片失败可诊断，缺原图直接留空',async()=>{
+  const f=await setup();const runner=new CodexImageRunner({traceFactory:fakeTraceFactory});let reason='内置生图连接失败，未返回图片';
+  try{
+    const dir=path.join(f.outputRoot,'timeout');const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:dir});runner.threadId='fixture';
+    runner.client={async startThread(){return 'fixture-next';},async runTurn(options){assert.equal(options.timeoutMs,5*60*1000);assert.equal(options.timeoutMs,IMAGE_TURN_TIMEOUT_MS);return {messages:[JSON.stringify({status:'blocked',reason,attempts:1})],items:[]};},close(){}};
+    const candidate=planCandidates(snapshot,{sourceAngles:false})[0];
+    await assert.rejects(()=>runner.generate({snapshot},candidate,dir),e=>Boolean(e.failureCode));
+    reason='唯一一次生图请求长时间未返回图片，已终止等待，无法核对或保存。';await assert.rejects(()=>runner.generate({snapshot},candidate,dir),e=>Boolean(e.failureCode));
+    reason='没有当前规格背面证据';assert.equal((await runner.generate({snapshot},{...candidate,view:'back',viewLabel:'背面'},dir)).status,'skipped');
+  }finally{runner.close();await f.clean();}
+});
+
 test('连接等待暂停队列、重复提交合并、停止解除等待，历史模型任务不能自动续跑',async()=>{
  const f=await setup();let opens=0;const service=new GenerationService({...f,runnerFactory:()=>({async open(){if(++opens===1)throw new WebWait('login','请登录会员网页');return null;},async generate(job,c,dir){const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file};},close(){}})});
  try{
   const a=await service.create('123','purple');const b=await service.create('123','blue');await waitFor(()=>!service.active&&service.get(a.id).waitReason==='login');
   assert.equal(service.get(a.id).status,'paused');assert.equal(service.get(b.id).status,'queued');assert.equal(opens,1);assert.equal((await service.create('123','purple')).id,a.id);
   f.store.recover();assert.equal(service.get(a.id).waitReason,'login'); // queued tasks become paused on restart
-  await service.stop(a.id);await service.resume(b.id);await waitFor(()=>!service.active&&service.get(b.id).status==='partial');assert.equal(opens,2);
+  await service.stop(a.id);await service.resume(b.id);await waitFor(()=>!service.active&&service.get(b.id).status==='done');assert.equal(opens,2);
   const legacy=service.get(a.id);delete legacy.provider;delete legacy.requestedModel;legacy.status='paused';f.store.saveImageJob(legacy);
   const strict=new GenerationService({...f});try{await assert.rejects(()=>strict.resume(a.id),/历史模型批次/);}finally{await strict.close();}
  }finally{await service.close();await f.clean();}
@@ -40,13 +77,13 @@ test('冻结素材只取当前规格原图，保留来源与技能版本，不�
     f.p.fields=extractFields([{text:'长度: 4cm'},{text:'宽度: 3cm'}]);
     const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:path.join(f.outputRoot,'batch')});
     assert.deepEqual(snapshot.refs.map(r=>r.imageId),['i-purple']);assert.equal(snapshot.skill.sha256.length,64);
-    const candidates=planCandidates(snapshot,{sourceAngles:false});assert.equal(candidates.length,6);assert.equal(candidates.filter(c=>c.status==='blocked').length,2);
+    const candidates=planCandidates(snapshot,{sourceAngles:false});assert.equal(candidates.length,6);assert.equal(candidates.filter(c=>c.status==='blocked').length,0);assert.equal(candidates.filter(c=>c.warnings?.some(w=>w.code==='scale_unverified')).length,2);
     assert.deepEqual(candidates.filter(c=>c.scene==='angle').map(c=>c.view),['front','side','back']);
     assert.deepEqual(candidates.filter(c=>c.scene!=='angle').map(c=>c.id),['use-A','overview-A','scale-A']);
     const back=candidateInput({snapshot},candidates.find(c=>c.view==='back'),path.join(f.outputRoot,'batch'))[0].text;assert.match(back,/没有证据则返回blocked，不调用生图/);
     await writeFile(path.join(f.dataDir,'images/123/purple.png'),'changed');assert.deepEqual(await readFile(path.join(f.outputRoot,'batch/input/01.png')),PNG);
     const input=candidateInput({snapshot},candidates[3],path.join(f.outputRoot,'batch'));
-    assert.ok(input.some(i=>i.type==='skill'));assert.equal(input.filter(i=>i.type==='localImage').length,1);
+    assert.equal(input.some(i=>i.type==='skill'),false);assert.equal(input.filter(i=>i.type==='localImage').length,1);
     assert.ok(!input.filter(i=>i.type==='localImage').some(i=>i.path.includes('blue')));
     await assert.rejects(()=>freezeInput({...f,product:{...f.p,images:[]},variant:f.p.variants[0],batchDir:path.join(f.outputRoot,'bad')}),/没有明确关联/);
     await assert.rejects(()=>freezeInput({...f,product:{...f.p,images:f.p.images.map(i=>({...i,qualityStatus:'fallback'}))},variant:f.p.variants[0],batchDir:path.join(f.outputRoot,'bad')}),/缩略图/);
@@ -61,12 +98,11 @@ test('重复点击合并任务，两个规格串行执行；部分失败保留�
     close(){active--;}
   })});
   try{
-    const [a,b]=await Promise.all([service.create('123','purple'),service.create('123','purple')]);assert.equal(a.id,b.id);assert.equal(a.provider,'codex');assert.equal(a.requestedModel,'gpt-6.1-sol');assert.equal(a.reasoningEffort,'low');
+    const [a,b]=await Promise.all([service.create('123','purple'),service.create('123','purple')]);assert.equal(a.id,b.id);assert.equal(a.provider,'codex');assert.equal(a.requestedModel,'gpt-6.1-sol');assert.equal(a.reasoningEffort,'medium');
     const blue=await service.create('123','blue');await waitFor(()=>!['queued','running'].includes(service.get(blue.id).status));
-    const j=service.get(a.id);assert.equal(j.status,'partial');assert.equal(imageJobSummary(j).completed,3);assert.equal(maxActive,1);
-    const before=calls.length;await service.resume(j.id,{retry:true});await waitFor(()=>!['queued','running'].includes(service.get(j.id).status));assert.equal(calls.length,before+1);assert.equal(imageJobSummary(service.get(j.id)).completed,4);
+    const j=service.get(a.id);assert.equal(j.status,'partial');assert.equal(imageJobSummary(j).completed,5);assert.equal(maxActive,1);
     const p=f.store.product('123');for(const key of ['length','width'])p.variants[0].fields[key]={value:3,status:'manual',sources:[]};f.store.saveProduct(p);
-    await service.resume(j.id);await waitFor(()=>service.get(j.id).status==='done');assert.equal(imageJobSummary(service.get(j.id)).completed,6);assert.equal(service.get(j.id).snapshot.fields.length.status,'missing');assert.equal(service.get(j.id).confirmedUpdates.length.status,'manual');
+    const before=calls.length;await service.resume(j.id,{retry:true});await waitFor(()=>service.get(j.id).status==='done');assert.equal(calls.length,before+1);assert.equal(imageJobSummary(service.get(j.id)).completed,6);assert.equal(service.get(j.id).snapshot.fields.length.status,'missing');assert.equal(service.get(j.id).confirmedUpdates.length.status,'manual');
     const next=await service.create('123','purple');assert.notEqual(next.id,j.id);await service.stop(next.id);
   }finally{await service.close();await f.clean();}
 });
@@ -80,12 +116,12 @@ test('停止和服务重启保留结果，未完成候选可继续，采集任�
   }finally{await service.close();await f.clean();}
 });
 
-test('未实际生成、未查看的结果不能成为成品；路径穿越和符号链接不能下载',async()=>{
+test('未实际生成的结果不能成为成品；路径穿越和符号链接不能下载',async()=>{
   const f=await setup();try{
-    const runner=new CodexImageRunner({ocr:{}});runner.threadId='test';const base={messages:[JSON.stringify({status:'completed',path:'/tmp/fake.png',reviewed:false,reason:'fake'})],items:[]};runner.client={runTurn:async()=>base,startThread:async()=> 'fresh-test'};
+    const runner=new CodexImageRunner({traceFactory:fakeTraceFactory,ocr:{}});runner.threadId='test';const base={messages:[JSON.stringify({status:'completed',path:'/tmp/fake.png',reviewed:false,reason:'fake'})],items:[]};runner.client={runTurn:async()=>base,startThread:async()=> 'fresh-test'};
     const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:path.join(f.outputRoot,'batch')});const j={snapshot};const c=planCandidates(snapshot,{sourceAngles:false})[2];
-    await assert.rejects(()=>runner.generate(j,c,path.join(f.outputRoot,'batch'),{onEvent:()=>{}}),/尚未经过逐张检查/);
-    base.messages=[JSON.stringify({status:'completed',path:'/tmp/fake.png',reviewed:true,reason:'fake'})];await assert.rejects(()=>runner.generate(j,c,path.join(f.outputRoot,'batch'),{onEvent:()=>{}}),/未收到内置生图/);
+    await assert.rejects(()=>runner.generate(j,c,path.join(f.outputRoot,'batch'),{onEvent:()=>{}}),/未收到实际生图/);
+    base.messages=[JSON.stringify({status:'completed',path:'/tmp/fake.png',reviewed:true,reason:'fake'})];await assert.rejects(()=>runner.generate(j,c,path.join(f.outputRoot,'batch'),{onEvent:()=>{}}),/未收到实际生图/);
     await writeFile(path.join(f.outputRoot,'batch/input/01.png'),'tampered');await assert.rejects(()=>runner.generate(j,c,path.join(f.outputRoot,'batch'),{onEvent:()=>{}}),/冻结的参考图片发生变化/);
     await mkdir(path.join(f.dir,'outside'));await writeFile(path.join(f.dir,'outside','private.txt'),'private');await symlink(path.join(f.dir,'outside'),path.join(f.outputRoot,'leak'),'junction');
     await assert.rejects(()=>containedFile(f.outputRoot,'../outside/private.txt'),/超出/);await assert.rejects(()=>containedFile(f.outputRoot,'leak/private.txt'),/超出/);assert.equal(imageType(PNG),'png');assert.throws(()=>imageType(Buffer.from('not an image')),/真实图片/);
@@ -126,22 +162,22 @@ test('生图返回后先发布可读取预览，核对未结束时也不把草�
   const f=await setup();try{
     const dir=path.join(f.outputRoot,'batch');const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:dir});await mkdir(path.join(dir,'results'),{recursive:true});
     const output=path.join(dir,'results/preview.png');await writeFile(output,Buffer.concat([PNG,Buffer.alloc(2048)]));
-    const runner=new CodexImageRunner({ocr:{dimensions:async()=>({width:1024,height:1024})}});runner.threadId='t';let release,seen=false;
+    const runner=new CodexImageRunner({traceFactory:fakeTraceFactory,ocr:{dimensions:async()=>({width:1024,height:1024})}});runner.threadId='t';let release,seen=false;
     runner.client={runTurn:async({onEvent})=>{onEvent({method:'item/completed',params:{turnId:'t',item:{id:'g',type:'imageGeneration',status:'completed',savedPath:output}}});await new Promise(r=>{release=r;});return {messages:[JSON.stringify({status:'failed',reviewed:false,reason:'测试：待调整',attempts:1,productBrief:'商品事实'})],items:[]};}};
     const promise=runner.generate({snapshot},planCandidates(snapshot,{sourceAngles:false})[2],dir,{onEvent:({preview})=>{if(preview){assert.equal(preview.review,'pending');assert.ok(preview.file.startsWith('drafts/'));seen=true;}}});
-    await waitFor(()=>seen);release();const result=await promise;assert.equal(result.status,'failed');assert.equal(result.reason,'测试：待调整');
+    await waitFor(()=>seen);release();const result=await promise;assert.equal(result.status,'completed');assert.equal(result.reviewState,'pending_user');assert.equal(result.reason,'测试：待调整');assert.ok(result.warnings.some(w=>w.code==='visual_issue'));
   }finally{await f.clean();}
 });
 
 test('每张使用独立会话，记录跳过与失败用量，三视角及单张修改不会串位置',async()=>{
   const f=await setup();let threads=0;const sent=[];const events=[];
   const client={async connect(){},async request(){return {data:[{isDefault:true,model:'gpt-5.6-sol'},{model:'gpt-6.1-sol'}]};},async startThread(){return 'isolated-'+(++threads);},async runTurn(options){sent.push(options);return {usage:{tokensKnown:true,inputTokens:100,cachedInputTokens:60,outputTokens:5,totalTokens:105,imageCalls:0},messages:[JSON.stringify({status:'blocked',path:null,reviewed:false,reason:'没有当前规格背面证据',recommendation:'',attempts:0,productBrief:'商品正面已确认'})],items:[]};},close(){}};
-  const runner=new CodexImageRunner({clientFactory:()=>client});
+  const runner=new CodexImageRunner({traceFactory:fakeTraceFactory,clientFactory:()=>client});
   try{
     const dir=path.join(f.outputRoot,'independent');const snapshot=await freezeInput({...f,product:f.p,variant:f.p.variants[0],batchDir:dir});const candidates=planCandidates(snapshot,{sourceAngles:false});
     await runner.open({snapshot},dir,()=>{});
-    for(const c of candidates.filter(c=>c.scene==='angle'))await runner.generate({snapshot,viewEvidence:{side:['i-purple'],back:['i-purple']}},c,dir,{onEvent:e=>events.push(e)});
-    assert.equal(threads,3);assert.equal(new Set(sent.map(x=>x.threadId)).size,3);assert.ok(sent.every(x=>x.collectUsage&&x.effort==='low'));assert.equal(runner.model,'gpt-6.1-sol');assert.equal(events.filter(x=>x.usage).length,3);assert.equal(events.filter(x=>x.threadId).length,2);
+    for(const c of candidates.filter(c=>c.scene==='angle'))await assert.rejects(()=>runner.generate({snapshot,viewEvidence:{side:['i-purple'],back:['i-purple']}},c,dir,{onEvent:e=>events.push(e)}),/没有当前规格背面证据/);
+    assert.equal(threads,3);assert.equal(new Set(sent.map(x=>x.threadId)).size,3);assert.ok(sent.every(x=>x.collectUsage&&x.effort==='medium'));assert.equal(runner.model,'gpt-6.1-sol');assert.equal(events.filter(x=>x.usage).length,3);assert.equal(events.filter(x=>x.threadId).length,2);
     assert.match(sent[2].input[0].text,/指定独立视角：背面/);assert.ok(sent.every(x=>!x.input[0].text.includes('后续候选沿用此上下文')));
   }finally{runner.close();await f.clean();}
 });
@@ -154,17 +190,17 @@ test('旧十二张批次重试保持十二个位置，新批次仍为六张，�
     onEvent({usage});const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file,hash:'fixture'};
   },close(){}})});
   try{
-    const a=await service.create('123','purple');await waitFor(()=>!['queued','running'].includes(service.get(a.id).status));const old=service.get(a.id);assert.equal(old.usage.imageCalls,4);assert.equal(old.usage.totalTokens,420);
+    const a=await service.create('123','purple');await waitFor(()=>!['queued','running'].includes(service.get(a.id).status));const old=service.get(a.id);assert.equal(old.usage.imageCalls,6);assert.equal(old.usage.totalTokens,630);
     old.candidates=planCandidates(old.snapshot,{legacy:true}).map(c=>old.candidates.find(x=>x.id===c.id)||c);delete old.planVersion;f.store.saveImageJob(old);
-    await service.resume(a.id,{retry:true});await waitFor(()=>!['queued','running'].includes(service.get(a.id).status));const done=service.get(a.id);assert.equal(done.candidates.length,12);assert.equal(done.candidates.filter(c=>c.status==='completed').length,6);assert.equal(done.usage.imageCalls,7);assert.equal(done.candidates.find(c=>c.id==='overview-A').usageHistory.length,2);
+    await service.resume(a.id,{retry:true});await waitFor(()=>!['queued','running'].includes(service.get(a.id).status));const done=service.get(a.id);assert.equal(done.candidates.length,12);assert.equal(done.candidates.filter(c=>c.status==='completed').length,12);assert.equal(done.usage.imageCalls,13);assert.equal(done.candidates.find(c=>c.id==='overview-A').usageHistory.length,2);
     const b=await service.create('123','blue');assert.equal(b.candidates.length,6);await service.stop(b.id);
   }finally{await service.close();await f.clean();}
 });
 
 test('缺少GPT-6.1 Sol时不回退默认模型，缺少侧背依据不启动模型回合',async()=>{
  let started=0;const client={async connect(){},async request(){return {data:[{model:'gpt-5.6-sol',isDefault:true}]};},async startThread(){started++;},close(){}};
- const runner=new CodexImageRunner({clientFactory:()=>client});
- try{await assert.rejects(()=>runner.open({requestedModel:'gpt-6.1-sol'},os.tmpdir(),()=>{}),/未提供 GPT-6.1 Sol/);assert.equal(started,0);for(const view of ['side','back']){const result=await runner.generate({}, {view,viewLabel:view},os.tmpdir(),{onEvent:()=>{}});assert.equal(result.status,'blocked');assert.equal(result.attempts,0);}}finally{runner.close();}
+ const runner=new CodexImageRunner({traceFactory:fakeTraceFactory,clientFactory:()=>client});
+ try{await assert.rejects(()=>runner.open({requestedModel:'gpt-6.1-sol'},os.tmpdir(),()=>{}),/未提供 GPT-6.1 Sol/);assert.equal(started,0);for(const view of ['side','back']){const result=await runner.generate({}, {view,viewLabel:view},os.tmpdir(),{onEvent:()=>{}});assert.equal(result.status,'skipped');assert.equal(result.attempts,0);}}finally{runner.close();}
 });
 
 test('旧批次仅迁移未完成角度位，不覆盖已完成文件、六个位置或人工参数',async()=>{

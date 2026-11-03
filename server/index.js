@@ -15,7 +15,7 @@ import {ReviewService} from './review.js';
 import {ListingService} from './listing.js';
 import {bundledSkillPath} from './platform.js';
 import {inspectEnvironment} from './environment.js';
-import {CODEX_IMAGE_MODEL,IMAGE_REASONING_EFFORT} from './image-model.js';
+import {CODEX_IMAGE_MODEL,IMAGE_REASONING_EFFORT,IMAGE_EXECUTION_POLICY} from './image-model.js';
 import {closeMetadataTools} from './metadata-tool.js';
 
 export const ROOT=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
@@ -63,7 +63,7 @@ export function createApp({dataDir=path.join(ROOT,'data'),collectorFactory,store
     try{const job=await generation.create(req.params.id,req.params.skuId,{autoRepair:req.body.autoRepair===true});res.status(201).json({id:job.id});}catch(e){res.status(409).json({error:e.message});}
   });
   app.use('/api/chatgpt',(req,res)=>res.status(410).json({error:'网页生图方案已停用；新图片任务使用Codex GPT-6.1 Sol。'}));
-  app.get('/api/generation/config',(req,res)=>res.json({provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT}));
+  app.get('/api/generation/config',(req,res)=>res.json({provider:'codex',requestedModel:CODEX_IMAGE_MODEL,reasoningEffort:IMAGE_REASONING_EFFORT,executionPolicy:IMAGE_EXECUTION_POLICY}));
   app.patch('/api/generation-jobs/:id/evidence',async(req,res)=>{try{res.json(await generation.setEvidence(req.params.id,req.body.view,req.body.imageIds));}catch(e){res.status(409).json({error:e.message});}});
   app.post('/api/generation-jobs/:id/source-angles',async(req,res)=>{try{res.json(await generation.sourceAngles(req.params.id));}catch(e){res.status(409).json({error:e.message});}});
   app.get('/api/style-preferences',(req,res)=>res.json({preferences:generation.preferences()}));

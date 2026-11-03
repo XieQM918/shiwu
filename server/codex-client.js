@@ -54,26 +54,39 @@ export class CodexClient extends EventEmitter {
     const result=await this.request('thread/start',{cwd,sandbox:'workspace-write',approvalPolicy:'never',developerInstructions,model,
       config:{'features.apps':false,'features.plugins':false,'features.multi_agent':false,'features.browser_use':false,'features.computer_use':false}});
     this.lastThreadModel=result.model||result.thread?.model||null;
+    this.threadPaths||=new Map();if(result.thread?.path)this.threadPaths.set(result.thread.id,result.thread.path);
     if(expectedModel&&this.lastThreadModel!==expectedModel)throw new Error('Codex未确认指定模型 '+expectedModel+'；未启动生图，不回退其他模型。');
     return result.thread.id;
   }
-  async runTurn({threadId,input,outputSchema,onEvent=()=>{},signal,effort='low',collectUsage=false,timeoutMs=25*60*1000,timeoutMessage='本张图片生成超时；可重试未完成项。'}){
+  async threadPath(threadId){
+    if(this.threadPaths?.has(threadId))return this.threadPaths.get(threadId);
+    const result=await this.request('thread/read',{threadId,includeTurns:false});return result.thread?.path||null;
+  }
+  async runTurn({threadId,input,outputSchema,onEvent=()=>{},signal,effort='low',collectUsage=false,maxModelSteps,timeoutMs=25*60*1000,timeoutMessage='本张图片生成超时；可重试未完成项。'}){
     let turnId;let timer;const items=[];const messages=[];
     const started=Date.now(),calls=new Map();this.tokenTotals||=new Map();const baseline=this.tokenTotals.get(threadId)||{};
-    const usage={threadId,startedAt:new Date(started).toISOString(),tokensKnown:false};let latest;
+    const usage={threadId,model:this.lastThreadModel||null,reasoningEffort:effort,startedAt:new Date(started).toISOString(),tokensKnown:false,modelSteps:0};let latest,priorInput=baseline.inputTokens||0;
     const snapshotUsage=()=>{const types=[...calls.values()];return {...usage,turnId,durationMs:Date.now()-started,
       imageCalls:types.filter(t=>t==='imageGeneration').length||types.filter(t=>t==='mcpImage').length,
       imageViews:types.filter(t=>t==='imageView').length,commands:types.filter(t=>t==='commandExecution').length};};
-    let completed=false;
+    let completed=false,budgetStopped=false;
     const done=new Promise((resolve,reject)=>{
       this.turnReject=reject;
       this.turnListener=event=>{
+        if(budgetStopped)return;
         const p=event.params||{};
         if(collectUsage&&event.method==='account/rateLimits/updated'){usage.quotaAfter=quotaWindows(p);return;}
         if(p.threadId!==threadId)return;
         if(collectUsage&&event.method==='thread/tokenUsage/updated'&&p.tokenUsage?.total){
           latest=p.tokenUsage.total;usage.tokensKnown=true;
+          if((latest.inputTokens||0)>priorInput){usage.modelSteps++;priorInput=latest.inputTokens||0;}
           for(const k of ['inputTokens','cachedInputTokens','outputTokens','reasoningOutputTokens','totalTokens'])usage[k]=Math.max(0,(latest[k]||0)-(baseline[k]||0));
+          usage.uncachedInputTokens=Math.max(0,usage.inputTokens-usage.cachedInputTokens);
+          if(maxModelSteps&&usage.modelSteps>=maxModelSteps&&!items.some(i=>i.type==='agentMessage'&&i.phase==='final')){
+            budgetStopped=true;
+            const error=new Error(`本张已达到${maxModelSteps}轮模型续跑上限，已停止，不自动重发。`);error.failureCode='model_step_limit';error.waitReason='model_step_limit';
+            const id=p.turnId||turnId;if(id)this.request('turn/interrupt',{threadId,turnId:id},5000).catch(()=>{});reject(error);return;
+          }
         }
         if(collectUsage&&event.method.startsWith('item/')&&p.item?.id){const i=p.item;calls.set(i.id,i.type==='mcpToolCall'&&/imagegen|image_gen/.test(`${i.server} ${i.tool}`)?'mcpImage':i.type);}
         onEvent(event);

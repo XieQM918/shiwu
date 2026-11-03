@@ -19,7 +19,7 @@ test('网页生图入口已停用且不再提供连接码，默认生图配置�
     for(const endpoint of ['/api/chatgpt/companion/setup','/api/chatgpt/companion/extension.zip','/api/chatgpt/browser/status','/api/chatgpt/companion/bridge/task']){
       const r=await fetch(base+endpoint);assert.equal(r.status,410);const j=await r.json();assert.match(j.error,/停用/);assert.equal(j.code,undefined);
     }
-    assert.deepEqual(await fetch(base+'/api/generation/config').then(r=>r.json()),{provider:'codex',requestedModel:'gpt-6.1-sol',reasoningEffort:'low'});
+    const config=await fetch(base+'/api/generation/config').then(r=>r.json());assert.equal(config.provider,'codex');assert.equal(config.requestedModel,'gpt-6.1-sol');assert.equal(config.reasoningEffort,'medium');assert.equal(config.executionPolicy.maxAdditionalWaits,1);
   }finally{await generation.close();await listing.close();await new Promise(r=>server.close(r));store.close();await rm(dir,{recursive:true,force:true});}
 });
 
