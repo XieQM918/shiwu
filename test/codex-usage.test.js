@@ -47,3 +47,18 @@ test('指定模型时必须核对App Server实际回显，不把默认模型当�
  await assert.rejects(()=>client.startThread({model:'gpt-6.1-sol',expectedModel:'gpt-6.1-sol'}),/未确认指定模型/);
  client.request=async()=>({thread:{id:'fixture'},model:'gpt-6.1-sol'});assert.equal(await client.startThread({model:'gpt-6.1-sol',expectedModel:'gpt-6.1-sol'}),'fixture');assert.equal(client.lastThreadModel,'gpt-6.1-sol');client.close();
 });
+
+test('图像会话显式选择JSONL历史且禁止模型回退，文案不强制改变历史模式',async()=>{
+ const client=new CodexClient();const requests=[];client.request=async(method,params)=>{requests.push({method,params});return {model:'gpt-6.1-sol',thread:{id:'trace',path:'/tmp/trace.jsonl',historyMode:params.historyMode||'paginated'}};};
+ try{await client.startThread({model:'gpt-6.1-sol',expectedModel:'gpt-6.1-sol',historyMode:'legacy'});assert.equal(requests[0].params.historyMode,'legacy');assert.equal(requests[0].params.ephemeral,false);assert.equal(requests[0].params.allowProviderModelFallback,false);
+  await client.startThread({model:'gpt-6.1-sol'});assert.equal(requests[1].params.historyMode,undefined);
+  client.request=async()=>({model:'gpt-6.1-sol',thread:{id:'bad',historyMode:'paginated'}});await assert.rejects(()=>client.startThread({historyMode:'legacy'}),e=>e.failureCode==='trace_unavailable'&&e.traceDiagnostics.stage==='history_mode');
+ }finally{client.close();}
+});
+
+test('日志初始化只注入本地记录并刷新路径，不启动模型，失败不静默降级',async()=>{
+ const client=new CodexClient();const requests=[];client.threadPaths=new Map([['trace','/tmp/stale.jsonl']]);client.request=async(method,params)=>{requests.push({method,params});if(method==='thread/read')return {thread:{path:'/tmp/ready.jsonl'}};return {};};
+ try{assert.equal(await client.prepareTrace('trace'),'/tmp/ready.jsonl');await client.prepareTrace('trace');assert.equal(requests.filter(r=>r.method==='thread/inject_items').length,1);assert.equal(requests.some(r=>r.method==='turn/start'),false);assert.equal(requests.find(r=>r.method==='thread/inject_items').params.items[0].role,'developer');
+  client.request=async()=>{throw new Error('method not found');};await assert.rejects(()=>client.prepareTrace('unsupported'),e=>e.failureCode==='trace_unavailable'&&e.traceDiagnostics.causeCode==='UNSUPPORTED');
+ }finally{client.close();}
+});

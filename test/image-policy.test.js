@@ -46,6 +46,22 @@ test('增量读取真实JSONL：中文跨块、未写完的行、路径越界及
   const outside=await mkdtemp(path.join(os.tmpdir(),'outside-'));try{const other=path.join(outside,'thread1.jsonl');await writeFile(other,'');await symlink(outside,path.join(dir,'escape'),'junction');await assert.rejects(()=>new ImageTraceMonitor({allowedRoot:dir}).start(path.join(dir,'escape/thread1.jsonl'),'thread1'),e=>e.failureCode==='trace_unavailable');}finally{await rm(outside,{recursive:true,force:true});}
  }finally{await monitor?.stop();await rm(dir,{recursive:true,force:true});}
 });
+
+test('空会话先返回路径、初始化后延迟落盘，不误报不可用，文件检查不计生图补查',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'shiw-trace-ready-'));const file=path.join(dir,'rollout-empty-thread.jsonl'),client=new CodexClient();let modelCalls=0,writes=0;const pending=[];
+ client.threadPaths=new Map([['empty-thread',file]]);client.request=async(method)=>{if(method==='thread/inject_items'){writes++;pending.push(new Promise(resolve=>setTimeout(()=>writeFile(file,'{"type":"session_meta"}\n').then(resolve),35)));return {}; }if(method==='thread/read')return {thread:{path:file}};if(method==='turn/start')modelCalls++;return {};};
+ const monitor=new ImageTraceMonitor({allowedRoot:dir,readyIntervalMs:5,readyTimeoutMs:500});
+ try{await monitor.start(await client.prepareTrace('empty-thread'),'empty-thread');assert.equal(modelCalls,0);assert.equal(writes,1);assert.ok(monitor.state.logReadyAttempts>1);assert.equal(monitor.state.additionalWaits,0);assert.equal(monitor.state.imageCalls,0);await appendFile(file,JSON.stringify(imageCall())+'\n'+JSON.stringify(running())+'\n'+JSON.stringify(wait())+'\n'+JSON.stringify(wait('second'))+'\n');await monitor.flush();assert.equal(monitor.error.failureCode,'poll_limit');}
+ finally{await monitor.stop();await Promise.all(pending);client.close();await rm(dir,{recursive:true,force:true});}
+});
+
+test('日志一直未落盘会限时失败并保留具体原因，路径缺失与任务停止可区分',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'shiw-trace-absent-'));const file=path.join(dir,'rollout-missing.jsonl');let monitor;
+ try{monitor=new ImageTraceMonitor({allowedRoot:dir,readyTimeoutMs:20,readyIntervalMs:5});await assert.rejects(()=>monitor.start(file,'missing'),e=>e.failureCode==='trace_unavailable'&&e.traceDiagnostics.causeCode==='ENOENT'&&e.traceDiagnostics.waitedMs>=20&&!e.message.includes('更新Codex'));
+ await assert.rejects(()=>monitor.start(null,'missing'),e=>e.traceDiagnostics.causeCode==='PATH_MISSING');
+ const controller=new AbortController(),cancel=setTimeout(()=>controller.abort(),10);await assert.rejects(()=>monitor.start(file,'missing',{signal:controller.signal}),/任务已停止/);clearTimeout(cancel);assert.equal(monitor.handle,null);
+ }finally{await monitor?.stop();await rm(dir,{recursive:true,force:true});}
+});
 async function fixture(){
  const dir=await mkdtemp(path.join(os.tmpdir(),'shiw-medium-'));await mkdir(path.join(dir,'input'));await mkdir(path.join(dir,'skill/references'),{recursive:true});
  const skill='# Skill\n## 3. 真实感与候选变化\n- 自然皮肤纹理、金属明暗过渡，左侧柔光。\n- 三张角度图分别完成正面、侧面、背面任务。\n## 4. 逐张生成与检查\n旧严格流程';

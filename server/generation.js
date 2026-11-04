@@ -61,7 +61,7 @@ export class CodexImageRunner {
     const instructions='你只负责当前一张商品摄影。摄影规范、原图和参考图已提供，不搜索目录、Skill、指南或记忆库，不重复view_image。只调用一次内置生图；exec首行必须设置yield_time_ms:120000；只允许一次wait补查且也必须120000；仍无结果立即failed。已展示结果简短核对一次，不追加审图或重画。不text输出完整工具结果或base64；返回实际图片路径，由工作台保存。缺尺寸不阻止出图，尺度仅供参考，不推算数值或隐藏结构。不读凭据、改设置、发消息或创建代理。';
     this.instructions=instructions;
     // A fresh runtime thread on recovery avoids accidentally continuing an interrupted tool call.
-    this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:instructions,model:this.model,expectedModel:this.model});
+    this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:instructions,model:this.model,expectedModel:this.model,historyMode:'legacy'});
     onEvent({threadId:this.threadId,model:this.model});return this.threadId;
   }
   async prepareSourceAngles(job,batchDir,{signal,onEvent}){
@@ -69,7 +69,7 @@ export class CodexImageRunner {
     let plan=await readAnglePlan(job.snapshot,batchDir);
     if(!plan){
       onEvent({message:'正在一次性选择原素材视角（不生图，后续复用选角结果）'});
-      const threadId=await this.client.startThread({cwd:batchDir,model:this.model,expectedModel:this.model,developerInstructions:'仅分析已附商品照片，返回指定JSON。不调用工具、不生图、不执行命令、不创建代理。仅识别实际拍到的视角与裁切区域，不推造新视角。'});
+      const threadId=await this.client.startThread({cwd:batchDir,model:this.model,expectedModel:this.model,historyMode:'legacy',developerInstructions:'仅分析已附商品照片，返回指定JSON。不调用工具、不生图、不执行命令、不创建代理。仅识别实际拍到的视角与裁切区域，不推造新视角。'});
       onEvent({threadId});
       const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)controller.abort();
       let forbidden=false,result;
@@ -104,13 +104,15 @@ export class CodexImageRunner {
     if(['side','back'].includes(candidate.view)&&!job.viewEvidence?.[candidate.view]?.length)return {status:'skipped',reasonCode:'source_missing',reason:'当前规格缺少'+candidate.viewLabel+'原图，此位置留空。',attempts:0};
     for(const ref of [...job.snapshot.refs,...job.snapshot.styleRefs])if(ref.hash&&hashBuffer(await readFile(await containedFile(batchDir,ref.path)))!==ref.hash)throw new Error('冻结的参考图片发生变化，请重新建立批次。');
     job={...job,styleProfile:await frozenStyle(job.snapshot,batchDir)};
-    if(this.usedThread){this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:this.instructions,model:this.model,expectedModel:this.model});onEvent({threadId:this.threadId});}
+    if(this.usedThread){this.threadId=await this.client.startThread({cwd:batchDir,developerInstructions:this.instructions,model:this.model,expectedModel:this.model,historyMode:'legacy'});onEvent({threadId:this.threadId});}
     this.usedThread=true;
     const controller=new AbortController(),abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)controller.abort();
     let trace,latestPreview,result,error,answer={};const nativeItems=new Map(),attempts=new Set(),previewTasks=[];const startedAt=Date.now();
     try{
       trace=this.traceFactory({onViolation:()=>controller.abort(),onChange:value=>onEvent({trace:value})});
-      await trace.start(await this.client.threadPath?.(this.threadId),this.threadId);
+      onEvent({message:'正在初始化本地监测记录（不调用模型）'});
+      const traceFile=this.client.prepareTrace?await this.client.prepareTrace(this.threadId):await this.client.threadPath?.(this.threadId);
+      await trace.start(traceFile,this.threadId,{signal:controller.signal});
       result=await this.client.runTurn({threadId:this.threadId,input:candidateInput(job,candidate,batchDir),outputSchema:RESULT_SCHEMA,signal:controller.signal,effort:IMAGE_REASONING_EFFORT,collectUsage:true,maxModelSteps:IMAGE_EXECUTION_POLICY.maxModelSteps,timeoutMs:IMAGE_TURN_TIMEOUT_MS,timeoutMessage:'本张任务准备及保存超过5分钟，已停止；生图等待上限为4分钟。',onEvent:event=>{
         const item=event.params?.item;
         if(item?.type==='imageGeneration'){
@@ -305,7 +307,10 @@ export class GenerationService {
       if(fresh)c.warnings=fresh.warnings;
       if(['side','back'].includes(c.view)&&job.viewEvidence?.[c.view]?.length&&c.status==='blocked'){c.status='pending';c.reason='';}
       if(c.status==='blocked'&&fresh?.status!=='blocked'&&(retry||c.scene==='use'||c.scene==='scale')){c.status='pending';c.reason='';}
-      if(retry&&c.status==='failed'){c.status='pending';c.reason='';}
+      if(retry&&c.status==='failed'){
+        c.attemptHistory||=[];c.attemptHistory.push({status:c.status,reason:c.reason,failureCode:c.failureCode,traceDiagnostics:c.traceDiagnostics,trace:c.trace,execution:c.execution,at:new Date().toISOString()});
+        c.status='pending';c.reason='';delete c.failureCode;delete c.traceDiagnostics;delete c.trace;
+      }
     }
     if(!job.candidates.some(c=>c.status==='pending')){
       job.message='没有可继续的候选；缺少依据的场景请先在规格行确认参数。';await this.persist(job);return job;
@@ -384,7 +389,7 @@ export class GenerationService {
           if(c.execution){c.execution.finishedAt=new Date().toISOString();c.execution.durationMs=Date.now()-Date.parse(c.execution.startedAt);c.execution.failureCode=e.failureCode||e.waitReason||'image_failed';}
           if(e.usage){c.usageHistory||=[];c.usageHistory.push(e.usage);job.usage=usageSummary(job);}
           if(active.stop||this.closing){c.status='pending';break;}
-          if(e.failureCode){c.failureCode=e.failureCode;if(e.trace)c.trace=e.trace;if(c.status==='running')c.status='failed';}
+          if(e.failureCode){c.failureCode=e.failureCode;if(e.trace)c.trace=e.trace;if(e.traceDiagnostics)c.traceDiagnostics=e.traceDiagnostics;if(c.status==='running')c.status='failed';}
           if(e.waitReason){if(c.status==='running')c.status='pending';if(c.status!=='completed')c.reason=e.message;throw e;}
           c.status='failed';c.reason=e.message;
           // A broken transport/auth connection cannot be repaired by generating the next eleven images.

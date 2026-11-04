@@ -50,17 +50,31 @@ export class CodexClient extends EventEmitter {
     this.emit('notification',message);
   }
   fail(error){for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(error);}this.pending.clear();this.emit('disconnect',error);}
-  async startThread({cwd=this.cwd,developerInstructions,model,expectedModel}={}){
-    const result=await this.request('thread/start',{cwd,sandbox:'workspace-write',approvalPolicy:'never',developerInstructions,model,
+  async startThread({cwd=this.cwd,developerInstructions,model,expectedModel,historyMode}={}){
+    const result=await this.request('thread/start',{cwd,sandbox:'workspace-write',approvalPolicy:'never',developerInstructions,model,historyMode,ephemeral:false,allowProviderModelFallback:false,
       config:{'features.apps':false,'features.plugins':false,'features.multi_agent':false,'features.browser_use':false,'features.computer_use':false}});
     this.lastThreadModel=result.model||result.thread?.model||null;
     this.threadPaths||=new Map();if(result.thread?.path)this.threadPaths.set(result.thread.id,result.thread.path);
     if(expectedModel&&this.lastThreadModel!==expectedModel)throw new Error('Codex未确认指定模型 '+expectedModel+'；未启动生图，不回退其他模型。');
+    if(historyMode&&result.thread?.historyMode&&result.thread.historyMode!==historyMode){const e=new Error('Codex未启用本任务要求的JSONL监测记录；未启动生图。');e.failureCode=e.waitReason='trace_unavailable';e.traceDiagnostics={stage:'history_mode',actual:result.thread.historyMode};throw e;}
     return result.thread.id;
   }
-  async threadPath(threadId){
-    if(this.threadPaths?.has(threadId))return this.threadPaths.get(threadId);
-    const result=await this.request('thread/read',{threadId,includeTurns:false});return result.thread?.path||null;
+  async threadPath(threadId,{refresh=false}={}){
+    if(!refresh&&this.threadPaths?.has(threadId))return this.threadPaths.get(threadId);
+    const result=await this.request('thread/read',{threadId,includeTurns:false},5000);const file=result.thread?.path||null;
+    if(file){this.threadPaths||=new Map();this.threadPaths.set(threadId,file);}return file;
+  }
+  async prepareTrace(threadId){
+    // Empty threads can advertise a rollout path before the file exists. A
+    // local injection materializes history without starting a model turn.
+    this.tracePrepared||=new Set();
+    try{
+      if(!this.tracePrepared.has(threadId)){
+        await this.request('thread/inject_items',{threadId,items:[{type:'message',role:'developer',content:[{type:'input_text',text:'本机工作台：本会话只处理当前一张图片，实际工具记录由本机监测。'}]}]},5000);
+        this.tracePrepared.add(threadId);
+      }
+      return await this.threadPath(threadId,{refresh:true});
+    }catch(cause){const e=new Error('无法初始化本任务的本地监测记录；未启动生图，请查看日志初始化诊断。');e.failureCode=e.waitReason='trace_unavailable';e.traceDiagnostics={stage:'bootstrap',causeCode:/method.*not found|unsupported|不支持/i.test(cause.message)?'UNSUPPORTED':/超时|timeout/i.test(cause.message)?'TIMEOUT':'CODEX_REQUEST_FAILED'};throw e;}
   }
   async runTurn({threadId,input,outputSchema,onEvent=()=>{},signal,effort='low',collectUsage=false,maxModelSteps,timeoutMs=25*60*1000,timeoutMessage='本张图片生成超时；可重试未完成项。'}){
     let turnId;let timer;const items=[];const messages=[];

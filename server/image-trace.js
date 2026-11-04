@@ -64,17 +64,32 @@ export class ImageTracePolicy{
 }
 
 export class ImageTraceMonitor{
-  constructor(options={}){this.guard=new ImageTracePolicy(options);this.allowedRoot=options.allowedRoot||path.join(process.env.CODEX_HOME||os.homedir()+'/.codex','sessions');this.intervalMs=options.intervalMs||100;}
+  constructor(options={}){this.guard=new ImageTracePolicy(options);this.allowedRoot=options.allowedRoot||path.join(process.env.CODEX_HOME||os.homedir()+'/.codex','sessions');this.intervalMs=options.intervalMs||100;this.readyTimeoutMs=options.readyTimeoutMs??3000;this.readyIntervalMs=options.readyIntervalMs??100;}
   get error(){return this.guard.error;}get state(){return {...this.guard.state};}
   returnedImage(){this.guard.returnedImage();}
-  async start(file,threadId){
-    try{
-      const base=await realpath(this.allowedRoot),target=await realpath(file||'');
-      if(!target.startsWith(base+path.sep)||!path.basename(target).includes(threadId))throw new Error('invalid trace path');
-      this.handle=await open(target,'r');const stat=await this.handle.stat();if(!stat.isFile())throw new Error('not a file');
-      this.position=stat.size;this.decoder=new StringDecoder('utf8');this.pending='';
-      this.timer=setInterval(()=>this.flush().catch(()=>{}),this.intervalMs);return this;
-    }catch{await this.handle?.close().catch(()=>{});throw imageFailure('trace_unavailable','当前Codex没有提供可读取的本任务工具记录，无法保证一次补查；未启动生图，请更新Codex后重试。');}
+  async start(file,threadId,{signal}={}){
+    const began=Date.now();let attempts=0,stage='path';
+    for(;;){
+      if(signal?.aborted)throw new Error('任务已停止');
+      try{
+        attempts++;if(!file||!threadId)throw Object.assign(new Error('missing trace path'),{code:'PATH_MISSING'});
+        stage='realpath';const base=await realpath(this.allowedRoot),target=await realpath(file);
+        if(!target.startsWith(base+path.sep)||!path.basename(target).includes(threadId))throw Object.assign(new Error('invalid trace path'),{code:'PATH_OUTSIDE'});
+        stage='open';this.handle=await open(target,'r');const stat=await this.handle.stat();if(!stat.isFile())throw Object.assign(new Error('not a file'),{code:'NOT_FILE'});
+        this.position=stat.size;this.decoder=new StringDecoder('utf8');this.pending='';
+        this.guard.state.logReadyWaitMs=Date.now()-began;this.guard.state.logReadyAttempts=attempts;
+        this.timer=setInterval(()=>this.flush().catch(()=>{}),this.intervalMs);return this;
+      }catch(cause){
+        await this.handle?.close().catch(()=>{});this.handle=null;
+        if(cause.code==='ENOENT'&&Date.now()-began<this.readyTimeoutMs){
+          // Local filesystem readiness checks never invoke a model or poll an
+          // image tool, and don't consume the single allowed image wait.
+          await new Promise(resolve=>setTimeout(resolve,Math.min(this.readyIntervalMs,this.readyTimeoutMs-(Date.now()-began))));continue;
+        }
+        const reason=cause.code==='ENOENT'?'本任务日志文件尚未创建，等待文件就绪已超时':cause.code==='PATH_MISSING'?'Codex未返回本任务的日志路径':cause.code==='PATH_OUTSIDE'?'日志路径不属于本任务允许的记录目录':cause.code==='EACCES'||cause.code==='EPERM'?'本任务日志文件的读取权限被拒绝':'无法打开本任务的监测记录';
+        const error=imageFailure('trace_unavailable',reason+'；未启动生图。');error.traceDiagnostics={stage,causeCode:cause.code||'READ_FAILED',waitedMs:Date.now()-began,attempts};throw error;
+      }
+    }
   }
   async flush(){
     if(this.reading)return this.reading;if(!this.handle)return;
