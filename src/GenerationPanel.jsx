@@ -18,6 +18,8 @@ function queueInfo(job,history){
   if(job?.status!=='queued')return null;
   const queued=history.filter(j=>j.status==='queued').sort((a,b)=>(a.kind==='adjustment'?0:1)-(b.kind==='adjustment'?0:1)||a.createdAt.localeCompare(b.createdAt));
   const position=Math.max(1,queued.findIndex(j=>j.id===job.id)+1);const running=history.find(j=>j.status==='running'&&j.id!==job.id);
+  const blocker=job.queueBlockedBy||history.find(j=>j.id===job.id)?.queueBlockedBy;
+  if(blocker)return {label:'队列已暂停 · 排队第 '+position+' 位',blocker,message:'前序任务暂停：'+blocker.skuLabel+'（商品 '+blocker.productId+'）。原因：'+blocker.reason+' 请查看暂停任务，选择继续 / 重试，或停止该任务以放行后续队列。本任务尚未调用生图。'};
   return {label:'排队第 '+position+' 位 · 尚未开始',message:running?'正在等待前面的任务：'+running.skuLabel+'（商品 '+running.productId+'），已完成 '+running.completed+'/'+running.total+' 张。当前：'+(running.current||'准备中')+'。本任务尚未开始调用生图。':'已加入队列，等待调度开始；当前尚未调用生图。'};
 }
 
@@ -28,7 +30,7 @@ export function GenerationActions({product,variant,disabled,onStart,onOpen,histo
       {job?.status==='queued'?<Clock3 size={14}/>:active(job)?<LoaderCircle size={14} className="spin"/>:<Sparkles size={14}/>}生成 Etsy 图片
     </button>
     {!job&&<small>最多6张：主图1、外观1、角度3、手持1；缺少依据则跳过。</small>}
-    {job&&<div className="generation-row-status"><span className={job.status==='failed'?'text-red':''}>{queue?queue.label:LABELS[job.status]+' · '+job.completed+'/'+job.total}</span><button className="text-button" onClick={()=>onOpen(job.id)}>{job.completed?'查看成品':'查看进度'}</button></div>}
+    {job&&<div className="generation-row-status"><span className={job.status==='failed'?'text-red':''}>{queue?queue.label:LABELS[job.status]+' · '+job.completed+'/'+job.total}</span><button className="text-button" onClick={()=>onOpen(queue?.blocker?.id||job.id)}>{queue?.blocker?'查看暂停原因':job.completed?'查看成品':'查看进度'}</button></div>}
   </div>;
 }
 
@@ -62,8 +64,10 @@ export function GenerationPanel({jobId,history,onClose,onCreated,onRefresh}){
     {error&&<div role="alert" className="alert red generation-error"><TriangleAlert size={17}/>{error}</div>}
     {job?<>
       <div className="generation-toolbar"><div className="generation-progress-copy"><strong>{LABELS[job.status]}<span>{completed} / {job.candidates.length} 张</span></strong><p>{queue?.message||job.message}</p><div className="progress"><span style={{width:`${completed/job.candidates.length*100}%`}}/></div></div><div className="generation-controls">
+        {queue?.blocker&&<button className="button secondary" onClick={()=>onCreated(queue.blocker.id)}>查看暂停任务</button>}
         {active(job)?<button className="button secondary" disabled={busy} onClick={()=>command('stop')}><Square size={13}/>停止</button>:<>
           {job.status!=='done'&&job.provider!=='chatgpt_web'&&<button className="button secondary" disabled={busy} onClick={()=>command(job.candidates.some(c=>c.status==='failed')?'retry':'resume')}><Play size={14}/>继续 / 重试</button>}
+          {job.status==='paused'&&<button className="button secondary" disabled={busy} onClick={()=>command('stop')}><Square size={13}/>停止此任务，继续队列</button>}
           <button className="button secondary" disabled={busy} onClick={again}><RefreshCw size={14}/>重新生成</button>
         </>}
         <button className="button secondary" onClick={()=>setShowPreferences(v=>!v)}>风格偏好库</button><button className="button dark" disabled={busy||!completed} onClick={download}><FolderDown size={14}/>下载原批次图片包</button>

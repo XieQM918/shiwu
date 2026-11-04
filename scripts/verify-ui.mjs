@@ -74,6 +74,14 @@ try{
   downloadPromise=page.waitForEvent('download');await page.getByRole('button',{name:'下载图片',exact:true}).click();const zip=await downloadPromise;const zipPath=path.join(dir,'images.zip');await zip.saveAs(zipPath);
   const checked=await python(['-c','import zipfile,json,sys; z=zipfile.ZipFile(sys.argv[1]); names=z.namelist(); print(json.dumps({"names":names,"manifest":json.loads(z.read(next(n for n in names if n.endswith("图片清单.json"))))},ensure_ascii=False))',zipPath]);
   const {names,manifest}=JSON.parse(checked.stdout);assert.ok(names.some(n=>n.endsWith('01-主图/001-a.jpg')),JSON.stringify(names));assert.equal(manifest.images.length,2);assert.equal(manifest.images[1].status,'failed');assert.deepEqual(manifest.images[0].categories,['main','sku']);
+  // Current failures expose their queue hold; stopping only the blocker releases
+  // waiting work. No real model/image request is made by this fixture.
+  const held={...structuredClone(actualJob),id:'ui-held',productId:'other-product',skuId:'other-sku',status:'paused',waitReason:'image_connection',queueHold:true,message:'测试连接失败',snapshot:{...actualJob.snapshot,skuLabel:'暂停测试规格'},createdAt:new Date().toISOString()};
+  const waiting={...structuredClone(actualJob),id:'ui-waiting',status:'queued',createdAt:new Date(Date.now()+10).toISOString(),candidates:actualJob.candidates.map(c=>({...c,status:'pending',file:undefined}))};
+  store.saveImageJob(held);store.saveImageJob(waiting);
+  await page.getByText('队列已暂停 · 排队第 1 位',{exact:true}).waitFor();await page.getByRole('button',{name:'查看暂停原因',exact:true}).click();
+  await page.getByText('测试连接失败',{exact:true}).waitFor();await page.getByRole('button',{name:'停止此任务，继续队列',exact:true}).click();await untilUi(()=>store.imageJob('ui-waiting').status==='done');assert.equal(store.imageJob('ui-held').status,'stopped');
+  await page.getByRole('button',{name:'关闭 Etsy 图片生成',exact:true}).click();
   await page.getByRole('button',{name:'采集记录',exact:false}).click();await page.getByText('还没有采集记录').waitFor();assert.deepEqual(errors,[]);
   console.log('界面验证通过：示例链接、规格参数保存、失败图库、Excel/原图ZIP、生图按钮与进度、缺失参数提示、成品放大与ZIP、重新生成与历史批次、采集记录、收起修改弹窗、长期规则批准、文案修改与采用、人工编辑及导出一致。生图及文案使用隔离测试替身，实际生成另行联调。');
 }finally{await browser?.close();await generation.close();await listing.close();await new Promise(resolve=>server.close(resolve));store.close();await rm(dir,{recursive:true,force:true});}

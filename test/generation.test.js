@@ -24,6 +24,15 @@ async function setup(){
 }
 const waitFor=async(predicate)=>{for(let i=0;i<250;i++){if(predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('等待状态超时');};
 
+test('历史暂停批次不锁住五个新规格，新任务仍串行；当前连接失败明确阻塞后续队列',async()=>{
+ const f=await setup();let active=0,max=0;const starts=[];
+ f.store.saveImageJob({id:'old-paused',provider:'codex',requestedModel:'gpt-6.1-sol',productId:'old',skuId:'old',snapshot:{skuLabel:'历史雪花'},status:'paused',waitReason:'image_connection',message:'旧连接失败',createdAt:'2026-01-01',candidates:[{id:'old-image',status:'completed',file:'keep.png'}]});
+ const template=f.p.variants[0];f.p.variants=Array.from({length:5},(_,i)=>({...structuredClone(template),id:'new'+i,label:'新规格'+i}));f.p.images=f.p.variants.map((v,i)=>({...f.p.images[0],id:'new-image'+i,skuIds:[v.id]}));f.store.saveProduct(f.p);
+ const service=new GenerationService({...f,runnerFactory:()=>({async open(job){active++;max=Math.max(max,active);starts.push(job.skuId);return 'fixture';},async generate(job,c,dir){await new Promise(r=>setTimeout(r,3));const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file};},close(){active--;}})});
+ try{const jobs=await Promise.all(f.p.variants.map(v=>service.create('123',v.id)));await waitFor(()=>!service.active&&jobs.every(j=>service.get(j.id).status==='done'));assert.equal(starts.length,5);assert.equal(new Set(starts).size,5);assert.equal(max,1);assert.equal(service.get('old-paused').status,'paused');assert.equal(service.get('old-paused').candidates[0].file,'keep.png');
+ }finally{await service.close();await f.clean();}
+});
+
 test('图片已返回但达到执行上限，保留下载并暂停后续商品；不能开启自动重画',async()=>{
  const f=await setup();let calls=0;const service=new GenerationService({...f,runnerFactory:()=>({async open(){return 'fake';},async generate(job,c,dir){calls++;const file=`results/${c.filename}.png`;await writeFile(path.join(dir,file),PNG);return {status:'completed',file,pauseReason:'model_step_limit'};},close(){}})});
  try{const a=await service.create('123','purple');const b=await service.create('123','blue');await waitFor(()=>!service.active&&service.get(a.id).status==='paused');assert.equal(calls,1);assert.equal(service.get(b.id).status,'queued');assert.equal(service.get(a.id).candidates[0].status,'completed');assert.ok((await readFile((await service.imageFile(a.id,'use-A')).file)).length);await assert.rejects(()=>service.setOptions(a.id,{autoRepair:true}),/自动重画已关闭/);
@@ -42,7 +51,7 @@ test('JSON返回连接失败也暂停队列，不误报缺少依据或继续下�
     const a=await service.create('123','purple');const b=await service.create('123','blue');
     await waitFor(()=>!service.active&&service.get(a.id).waitReason==='image_connection');
     const paused=service.get(a.id);assert.equal(paused.status,'paused');assert.equal(paused.candidates[0].status,'completed');assert.equal(paused.candidates[1].status,'failed');assert.equal(paused.candidates[2].status,'pending');
-    assert.equal(service.get(b.id).status,'queued');assert.equal(calls.length,2);
+    assert.equal(service.get(b.id).status,'queued');assert.equal(calls.length,2);assert.equal(service.summaries().find(j=>j.id===b.id).queueBlockedBy.id,a.id);assert.equal(service.summaries().find(j=>j.id===b.id).queueBlockedBy.waitReason,'image_connection');
     await service.stop(b.id);broken=false;await service.resume(a.id,{retry:true});await waitFor(()=>!service.active&&service.get(a.id).status==='done');
     assert.equal(calls.filter(c=>c===a.id+'/use-A').length,1);assert.equal(service.get(a.id).candidates[1].status,'completed');
   }finally{await service.close();await f.clean();}

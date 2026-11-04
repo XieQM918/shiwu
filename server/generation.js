@@ -183,7 +183,11 @@ export class GenerationService {
     this.active=null;this.creating=new Map();this.closing=false;
     if(!this.customRunner)for(const job of this.store.imageJobs())if(job.provider==='chatgpt_web'&&['queued','running','paused'].includes(job.status)){job.status='stopped';delete job.waitReason;job.message='网页生图方案已停用；保留历史，请重新生成以使用Codex GPT-6.1 Sol。';this.store.saveImageJob(job);}
   }
-  summaries(){return this.store.imageJobs().map(imageJobSummary);}
+  queueBlocker(){return this.store.imageJobs().find(j=>j.queueHold===true&&j.waitReason&&j.status==='paused'&&(this.customRunner||j.provider==='codex'));}
+  summaries(){
+    const blocker=this.queueBlocker();
+    return this.store.imageJobs().map(job=>({...imageJobSummary(job),...(job.status==='queued'&&blocker?{queueBlockedBy:{id:blocker.id,productId:blocker.productId,skuLabel:blocker.snapshot?.skuLabel||blocker.skuId,reason:blocker.message,waitReason:blocker.waitReason}}:{})}));
+  }
   async create(productId,skuId,options={}){
     const key=`${productId}/${skuId}`;
     if(this.creating.has(key))return this.creating.get(key);
@@ -283,7 +287,7 @@ export class GenerationService {
       if(job.anglePlan.usage){job.candidates.find(c=>c.scene==='angle').usageHistory||=[];job.candidates.find(c=>c.scene==='angle').usageHistory.push(job.anglePlan.usage);}
       delete job.anglePlan;
     }
-    delete job.waitReason;
+    delete job.waitReason;delete job.queueHold;
     job.executionPolicy={...IMAGE_EXECUTION_POLICY,reasoningEffort:IMAGE_REASONING_EFFORT};
     job.policyHistory||=[];job.policyHistory.push({at:new Date().toISOString(),...job.executionPolicy});
     const current=this.store.product(job.productId)?.variants.find(v=>v.id===job.skuId);
@@ -311,7 +315,7 @@ export class GenerationService {
   async stop(id){
     const job=this.get(id);if(job.status==='done')return job;
     if(this.active?.id===id){this.active.stop=true;this.active.controller.abort();this.active.runner.close();}
-    delete job.waitReason;job.status='stopped';job.message='已停止，已完成图片保留。';
+    delete job.waitReason;delete job.queueHold;job.status='stopped';job.message='已停止，已完成图片保留。';
     for(const c of job.candidates)if(c.status==='running')c.status='pending';
     await this.persist(job);this.kick();return job;
   }
@@ -337,7 +341,9 @@ export class GenerationService {
   kick(){if(this.active||this.closing)return;queueMicrotask(()=>this.drain().catch(e=>{this.problem=e.message;}));}
   async drain(){
     if(this.active||this.closing)return;
-    if(this.store.imageJobs().some(j=>j.waitReason&&j.status==='paused'&&(this.customRunner||j.provider==='codex')))return;
+    // A historical paused batch is not a perpetual global queue lock. Only a
+    // failure in this queue policy holds following work until stop/continue.
+    if(this.queueBlocker())return;
     const job=this.store.imageJobs().filter(j=>j.status==='queued').sort((a,b)=>(a.kind==='adjustment'?0:1)-(b.kind==='adjustment'?0:1)||a.createdAt.localeCompare(b.createdAt))[0];if(!job)return;
     const runner=this.runnerFactory();const active={id:job.id,job,controller:new AbortController(),runner};let yielded=false;
     active.finished=new Promise(resolve=>{active.resolve=resolve;});this.active=active;
@@ -393,7 +399,7 @@ export class GenerationService {
       else if(yielded){job.status='queued';job.message='先处理风格调整，随后继续此批次';}
       else {const summary=imageJobSummary(job);job.status=summary.completed+summary.skipped===summary.total?'done':summary.completed?'partial':summary.failed?'failed':'blocked';job.message=`已生成 ${summary.completed}/${summary.total} 张${summary.skipped?`，${summary.skipped} 个位置缺素材留空`:''}${summary.blocked?`，${summary.blocked} 张缺少依据`:''}${summary.failed?`，${summary.failed} 张失败`:''}`;}
     }catch(e){
-      job.waitReason=e.waitReason||null;job.status=this.closing||e.waitReason?'paused':active.stop?'stopped':job.candidates.some(c=>c.status==='completed')?'partial':'failed';job.message=e.message;
+      job.waitReason=e.waitReason||null;job.queueHold=Boolean(e.waitReason);job.status=this.closing||e.waitReason?'paused':active.stop?'stopped':job.candidates.some(c=>c.status==='completed')?'partial':'failed';job.message=e.message;
       for(const c of job.candidates)if(c.status==='running')c.status='pending';
     }finally{
       runner.close();try{await this.persist(job);}finally{this.active=null;active.resolve();if(!this.closing)this.kick();}
